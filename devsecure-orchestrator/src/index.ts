@@ -7,12 +7,12 @@ import { getEmbedding } from "./embed";
 import { seedCWEData } from "./seed-data";
 import type { Env } from "./env";
 
-// HF Inference Router base — provider path: /hf-inference/models/{model}/v1/{endpoint}
-const HF_ROUTER = "https://router.huggingface.co/hf-inference/models";
+// HF Inference Router — single fixed endpoint; model is selected via the body "model" field
+const HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions";
 // Classification plane: advisory SLM (instruct/chat variant required for structured JSON output)
 const CLASSIFICATION_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct";
-// Execution plane: patch author agent (instruct variant for instruction-following)
-const REMEDIATION_MODEL = "Qwen/Qwen2.5-Coder-32B-Instruct";
+// Execution plane: patch author agent (Qwen3 Coder instruct variant)
+const REMEDIATION_MODEL = "Qwen/Qwen3-Coder-32B-Instruct";
 const GITHUB_API = "https://api.github.com";
 
 // Env is defined in env.ts and imported above.
@@ -53,22 +53,21 @@ async function hfChat(
   apiKey: string,
   maxTokens = 1024,
 ): Promise<string> {
-  // Model encoded in the URL path; body does not need a model field
-  const res = await fetch(
-    `${HF_ROUTER}/${model}/v1/chat/completions`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ messages, max_tokens: maxTokens, stream: false }),
+  // router.huggingface.co uses a single fixed URL for all models.
+  // The model is dispatched via the "model" field in the body — never in the URL path.
+  const res = await fetch(HF_CHAT_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
     },
-  );
+    body: JSON.stringify({ model, messages, max_tokens: maxTokens, stream: false }),
+  });
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`HF chat error [${model}]: HTTP ${res.status} – ${text}`);
+    const errorText = await res.text();
+    console.error(`HF chat error [${model}] HTTP ${res.status} — response: ${errorText}`);
+    throw new Error(`HF chat error [${model}]: HTTP ${res.status} – ${errorText}`);
   }
 
   const data = (await res.json()) as {
@@ -299,15 +298,20 @@ async function openPr(
     throw new Error(`Branch creation failed: HTTP ${branchRes.status} – ${await branchRes.text()}`);
   }
 
-  // 3. Fetch current file blob SHA (required by GitHub Contents API for updates)
+  // 3. Fetch current file blob SHA from the BASE branch (not the new fix branch,
+  //    which is a fresh copy and may not yet have the file if it was just added).
+  //    GitHub Contents API requires the existing blob SHA to update a file;
+  //    omitting it is correct for net-new files.
   let existingFileSha: string | undefined;
   const fileRes = await ghFetch(
-    `/repos/${repo}/contents/${filePath}?ref=${fixBranch}`,
+    `/repos/${repo}/contents/${filePath}?ref=${baseBranch}`,
     "GET",
     pat,
   );
   if (fileRes.ok) {
     existingFileSha = ((await fileRes.json()) as { sha: string }).sha;
+  } else {
+    console.log(`File ${filePath} not found on base branch — will be created as a new file.`);
   }
 
   // 4. Commit the fixed file (base64-encoded, UTF-8 safe)
@@ -430,19 +434,34 @@ export default {
       );
     }
 
+    // Auth guard — caller must supply the same secret as the GitHub Action
+    const authHeader = request.headers.get("Authorization");
+    if (!authHeader || authHeader !== `Bearer ${env.SEED_SECRET}`) {
+      return new Response(
+        JSON.stringify({ error: "Unauthorized." }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    let pipelineStep = "init";
     try {
       // ── Step 1: Classification (Qwen2.5) ──────────────────────────────────
+      pipelineStep = "classification";
       const classification = await classify(code, language, env.HF_API_KEY);
+      console.log("Classification result:", JSON.stringify(classification));
 
-      // ── Step 2: RAG context retrieval (Vectorize) ─────────────────────────
+      // ── Step 2: RAG context retrieval (Vectorize + CF AI embeddings) ───────
+      pipelineStep = "rag";
       const ragContext = await retrieveRagContext(
         classification.cwe_id,
         classification.summary,
         env.VECTOR_INDEX,
         env,
       );
+      console.log("RAG context length:", ragContext.length);
 
       // ── Step 3: Remediation (Qwen3) ───────────────────────────────────────
+      pipelineStep = "remediation";
       const remediation = await remediate(
         code,
         language,
@@ -452,6 +471,7 @@ export default {
       );
 
       // ── Step 4: Fail-closed gate ──────────────────────────────────────────
+      pipelineStep = "github";
       let githubUrl: string;
       let action: "pr_opened" | "issue_escalated";
 
@@ -489,8 +509,9 @@ export default {
       );
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
+      console.error(`Pipeline failure at step [${pipelineStep}]:`, detail);
       return new Response(
-        JSON.stringify({ error: "Pipeline failure.", detail }),
+        JSON.stringify({ error: "Pipeline failure.", step: pipelineStep, detail }),
         { status: 500, headers: { "Content-Type": "application/json" } },
       );
     }
