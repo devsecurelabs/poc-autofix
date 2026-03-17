@@ -7,12 +7,11 @@ import { getEmbedding } from "./embed";
 import { seedCWEData } from "./seed-data";
 import type { Env } from "./env";
 
-// HF Inference Router — single fixed endpoint; model is selected via the body "model" field
-const HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions";
-// Classification plane: advisory SLM (instruct/chat variant required for structured JSON output)
-const CLASSIFICATION_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct";
-// Execution plane: patch author agent (Qwen3 Coder instruct variant)
-const REMEDIATION_MODEL = "Qwen/Qwen3-Coder-32B-Instruct";
+// HF Inference Router — explicit provider path; model encoded in URL, not the request body
+const HF_CHAT_BASE = "https://router.huggingface.co/hf-inference/models";
+// Fallback model IDs — overridden at runtime by env.CLASSIFIER_MODEL / env.REMEDIATION_MODEL
+const DEFAULT_CLASSIFIER_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct";
+const DEFAULT_REMEDIATION_MODEL = "Qwen/Qwen2.5-Coder-32B-Instruct";
 const GITHUB_API = "https://api.github.com";
 
 // Env is defined in env.ts and imported above.
@@ -53,20 +52,20 @@ async function hfChat(
   apiKey: string,
   maxTokens = 1024,
 ): Promise<string> {
-  // router.huggingface.co uses a single fixed URL for all models.
-  // The model is dispatched via the "model" field in the body — never in the URL path.
-  const res = await fetch(HF_CHAT_URL, {
+  // Explicit provider path — model is encoded in the URL; body carries only messages.
+  const url = `${HF_CHAT_BASE}/${model}/v1/chat/completions`;
+  const res = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ model, messages, max_tokens: maxTokens, stream: false }),
+    body: JSON.stringify({ messages, max_tokens: maxTokens, stream: false }),
   });
 
   if (!res.ok) {
     const errorText = await res.text();
-    console.error(`HF chat error [${model}] HTTP ${res.status} — response: ${errorText}`);
+    console.error(`HF chat error [${model}] HTTP ${res.status} at ${url} — response: ${errorText}`);
     throw new Error(`HF chat error [${model}]: HTTP ${res.status} – ${errorText}`);
   }
 
@@ -86,6 +85,7 @@ async function classify(
   code: string,
   language: string,
   apiKey: string,
+  env: Env,
 ): Promise<ClassificationResult> {
   const system = `You are a senior application security engineer specialising in static analysis.
 Analyse the provided source code and return ONLY a valid JSON object — no prose, no markdown fences, no explanation.
@@ -107,8 +107,9 @@ Lane assignment guide:
 
   const user = `Language: ${language}\n\nVulnerable code:\n\`\`\`${language}\n${code}\n\`\`\``;
 
+  const classifierModel = env.CLASSIFIER_MODEL || DEFAULT_CLASSIFIER_MODEL;
   const raw = await hfChat(
-    CLASSIFICATION_MODEL,
+    classifierModel,
     [{ role: "system", content: system }, { role: "user", content: user }],
     apiKey,
     512,
@@ -159,6 +160,7 @@ async function remediate(
   classification: ClassificationResult,
   ragContext: string,
   apiKey: string,
+  env: Env,
 ): Promise<RemediationResult> {
   const system = `You are an expert secure-code engineer. You will receive vulnerable source code, a structured vulnerability classification, and RAG context containing CWE-indexed secure coding patterns and verified historical patch exemplars.
 
@@ -190,8 +192,9 @@ ${ragContext}
 ${code}
 \`\`\``;
 
+  const remediationModel = env.REMEDIATION_MODEL || DEFAULT_REMEDIATION_MODEL;
   const raw = await hfChat(
-    REMEDIATION_MODEL,
+    remediationModel,
     [{ role: "system", content: system }, { role: "user", content: user }],
     apiKey,
     2048,
@@ -447,7 +450,7 @@ export default {
     try {
       // ── Step 1: Classification (Qwen2.5) ──────────────────────────────────
       pipelineStep = "classification";
-      const classification = await classify(code, language, env.HF_API_KEY);
+      const classification = await classify(code, language, env.HF_API_KEY, env);
       console.log("Classification result:", JSON.stringify(classification));
 
       // ── Step 2: RAG context retrieval (Vectorize + CF AI embeddings) ───────
@@ -468,6 +471,7 @@ export default {
         classification,
         ragContext,
         env.HF_API_KEY,
+        env,
       );
 
       // ── Step 4: Fail-closed gate ──────────────────────────────────────────
