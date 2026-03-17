@@ -1,6 +1,5 @@
 name: Automated Code Remediation Pipeline
 
-# Trigger this workflow only when files in the vulnerable_code/ directory are pushed
 on:
   push:
     paths:
@@ -10,83 +9,93 @@ jobs:
   remediate:
     name: Analyze and Fix Code
     runs-on: ubuntu-latest
-    
-    # Grant the action permission to write back to the repository
+
     permissions:
-      contents: write 
+      contents: write
+
+    env:
+      # Explicit URL — never rely on a secret for the base URL to avoid "no URL specified" errors
+      WORKER_URL: "https://devsecure-orchestrator.quadri-jay.workers.dev/remediate"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Required to accurately detect changed files
+          fetch-depth: 0
 
       - name: Get changed files
         id: changed-files
-        # This community action easily lists exactly which files triggered the push
         uses: tj-actions/changed-files@v44
         with:
           files: vulnerable_code/**
 
       - name: Send to Cloudflare Worker and Save Fix
         env:
-          CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
+          WORKER_SECRET: ${{ secrets.DEVSECURE_WORKER_SECRET }}
         run: |
-          # Loop through every new/modified file in the vulnerable_code directory
           for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
             echo "Processing $file..."
-            
-            # Extract filename and extension to build the output path
+
             filename=$(basename -- "$file")
             extension="${filename##*.}"
             name="${filename%.*}"
-            
-            # Apply the naming convention: sample1_fixed.py
             fixed_filename="${name}_fixed.${extension}"
             output_path="remediated_code/${fixed_filename}"
-            
-            # Ensure the output directory exists
             mkdir -p remediated_code
-            
-            # Safely package the filename and code into a JSON payload using jq
-            JSON_PAYLOAD=$(jq -n \
-              --arg fn "$filename" \
-              --arg code "$(cat $file)" \
-              '{filename: $fn, code: $code}')
-            
-            echo "Sending $filename to Cloudflare Worker orchestration layer..."
-            
-            # Call the Cloudflare Worker via POST request
-            # We save the HTTP status code to check for success, and output the response to response.json
-            HTTP_STATUS=$(curl -s -w "%{http_code}" -o response.json -X POST -H "Content-Type: application/json" -d "$JSON_PAYLOAD" $CF_WORKER_URL)
-            
+
+            # --rawfile safely handles multi-line code, quotes, backslashes, and special chars
+            jq -n \
+              --arg repo    "${{ github.repository }}" \
+              --arg path    "$file" \
+              --rawfile code "$file" \
+              --arg lang    "${extension}" \
+              '{repo: $repo, file_path: $path, code: $code, language: $lang}' > payload.json
+
+            echo "Sending $filename to Worker..."
+
+            HTTP_STATUS=$(curl --silent --show-error \
+              --output response.json \
+              --write-out "%{http_code}" \
+              --request POST "$WORKER_URL" \
+              --header "Content-Type: application/json" \
+              --header "Authorization: Bearer $WORKER_SECRET" \
+              --data @payload.json)
+
+            echo "HTTP status: $HTTP_STATUS"
+
             if [ "$HTTP_STATUS" -eq 200 ]; then
-              echo "✅ Remediation successful for $filename!"
-              # Extract the fixed code from the Worker's JSON response and save it to the output path
-              jq -r '.fixed_code' response.json > "$output_path"
-              echo "Saved remediated code to $output_path"
+              ACTION=$(jq -r '.action // "unknown"' response.json)
+              echo "Worker action: $ACTION"
+
+              if [ "$ACTION" = "pr_opened" ]; then
+                # Worker opened a PR — extract fixed_code from remediation for local save
+                jq -r '.fixed_code // empty' response.json > "$output_path"
+                GITHUB_URL=$(jq -r '.github_url // ""' response.json)
+                echo "PR opened: $GITHUB_URL"
+                echo "Saved fix to $output_path"
+              elif [ "$ACTION" = "issue_escalated" ]; then
+                GITHUB_URL=$(jq -r '.github_url // ""' response.json)
+                echo "L4 escalation — issue opened: $GITHUB_URL"
+              else
+                echo "Unexpected action value: $ACTION"
+                cat response.json
+              fi
             else
-              echo "❌ Failed to remediate $filename. HTTP Status: $HTTP_STATUS"
+              echo "Failed to remediate $filename. HTTP status: $HTTP_STATUS"
               cat response.json
-              exit 1 # Fail the action so you are notified of the error
+              exit 1
             fi
           done
 
       - name: Commit and Push Remediated Code
         run: |
-          # Configure git as the GitHub Actions bot
-          git config --global user.name 'github-actions[bot]'
+          git config --global user.name  'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          
-          # Stage the newly created files
           git add remediated_code/
-          
-          # Check if there are actually changes to commit (prevents empty commit errors)
           if git diff-index --quiet HEAD --; then
             echo "No new remediations to commit."
           else
-            # The [skip ci] tag prevents this commit from accidentally triggering other workflows
-            git commit -m "Automated remediation: Added fixed code from Hugging Face AI [skip ci]"
+            git commit -m "chore: automated remediation output [skip ci]"
             git push
-            echo "🎉 Successfully pushed remediated code to the repository!"
+            echo "Pushed remediated code to repository."
           fi

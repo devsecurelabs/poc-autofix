@@ -33,8 +33,9 @@ jobs:
       - name: Detect changed files
         id: changed
         run: |
-          # List files changed in this PR relative to the base branch
-          git fetch origin ${{ github.base_ref }} --depth=1
+          # fetch-depth: 0 already fetched the full history above.
+          # Fetch the base branch ref so the three-dot diff has a merge base.
+          git fetch origin ${{ github.base_ref }}
           CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
           echo "files<<EOF" >> "$GITHUB_OUTPUT"
           echo "$CHANGED" >> "$GITHUB_OUTPUT"
@@ -126,7 +127,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          git fetch origin ${{ github.base_ref }} --depth=1
+          # fetch-depth: 0 already fetched the full history above.
+          # Fetch the base branch ref so the three-dot diff has a merge base.
+          git fetch origin ${{ github.base_ref }}
           CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
 
           echo "=== Files changed in this PR ==="
