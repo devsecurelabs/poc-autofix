@@ -436,6 +436,13 @@ export default {
 
     const { repo, file_path, code, language, base_branch = "main" } = body;
 
+    if (code.length > 100_000) {
+      return new Response(
+        JSON.stringify({ error: "Payload too large" }),
+        { status: 413, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
     if (!repo || !file_path || !code || !language) {
       return new Response(
         JSON.stringify({
@@ -446,8 +453,14 @@ export default {
       );
     }
 
-    // Auth guard — caller must supply the same secret as the GitHub Action
+    // 🔍 DEBUG TRACE + REQUEST LOGGING
+    const traceId = request.headers.get("X-Trace-Id") || "no-trace";
     const authHeader = request.headers.get("Authorization");
+
+    console.log("TRACE:", traceId, "| method:", request.method, "| path:", url.pathname);
+    console.log("Auth present:", !!authHeader, "| length:", authHeader?.length || 0);
+
+    // Auth guard — caller must supply the same secret as the GitHub Action
     if (!authHeader || authHeader !== `Bearer ${env.SEED_SECRET}`) {
       return new Response(
         JSON.stringify({ error: "Unauthorized." }),
@@ -456,6 +469,7 @@ export default {
     }
 
     let pipelineStep = "init";
+    const start = Date.now();
     try {
       // ── Step 1: Classification (Qwen2.5) ──────────────────────────────────
       pipelineStep = "classification";
@@ -464,12 +478,18 @@ export default {
 
       // ── Step 2: RAG context retrieval (Vectorize + CF AI embeddings) ───────
       pipelineStep = "rag";
-      const ragContext = await retrieveRagContext(
-        classification.cwe_id,
-        classification.summary,
-        env.VECTOR_INDEX,
-        env,
-      );
+      let ragContext = "";
+      try {
+        ragContext = await retrieveRagContext(
+          classification.cwe_id,
+          classification.summary,
+          env.VECTOR_INDEX,
+          env,
+        );
+      } catch (e) {
+        console.log("RAG failed, using fallback");
+        ragContext = "No RAG context available.";
+      }
       console.log("RAG context length:", ragContext.length);
 
       // ── Step 3: Remediation ───────────────────────────────────────────────
@@ -517,6 +537,8 @@ export default {
         );
         action = "pr_opened";
       }
+
+      console.log("Pipeline duration:", Date.now() - start, "ms");
 
       return new Response(
         JSON.stringify({
