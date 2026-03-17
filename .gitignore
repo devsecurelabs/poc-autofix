@@ -1,43 +1,80 @@
-# Dependencies
-node_modules/
-
-# Runtime data
-pids
-*.pid
-*.seed
-*.pid.lock
-
-# Compiled binary addons
-build
-
-# dotenv environment variables file
-.env
-.dev.vars
-
-# PM2
-.pm2/
-pids/
-logs/
-*.log
-
-# Backup files
-*.backup
-*.bak
-*.tar.gz
-*.zip
-
-# Wrangler
-.wrangler/
-wrangler.toml
-dist/
-
-# OS
+# -----------------------------
+# OS / Editor
+# -----------------------------
 .DS_Store
 Thumbs.db
-
-# IDE
 .vscode/
-.idea/
 .vs/
-*.swp
-*.swo
+.idea/
+
+# -----------------------------
+# Node / JS
+# -----------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+dist/
+build/
+.cache/
+
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+.venv/
+venv/
+env/
+
+# -----------------------------
+# Environment / Secrets
+# -----------------------------
+.env
+.env.*
+!.env.example
+
+# -----------------------------
+# Cloudflare / Wrangler
+# -----------------------------
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# -----------------------------
+# Logs / Temp
+# -----------------------------
+*.log
+tmp/
+temp/
+
+# -----------------------------
+# Coverage / Testing
+# -----------------------------
+coverage/
+.coverage
+htmlcov/
+.pytest_cache/
+
+# -----------------------------
+# Build / Artifacts
+# -----------------------------
+*.zip
+*.tar
+*.gz
+
+# -----------------------------
+# GitHub Actions artifacts
+# -----------------------------
+*.out
+response.json
+
+# -----------------------------
+# DevSecure specific
+# -----------------------------
+remediated_code/   # generated output (optional: keep if you want history)
