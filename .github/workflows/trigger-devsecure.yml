@@ -1,23 +1,60 @@
-- name: Build JSON payload
+name: Classify and Remediate
+on:
+  workflow_dispatch:
+    inputs:
+      file_path:
+        description: "Repo-relative path to the vulnerable file"
+        required: true
+        default: "vulnerable_code/sample1.py"
+
+jobs:
+  call-orchestrator:
+    name: Classify and Remediate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build JSON payload
+        id: build_json
         run: |
-          # Use --rawfile to safely read the entire file content into a JSON variable
-          # This is much safer than using shell variables for multi-line code
+          # We use --rawfile to safely ingest the code without shell expansion issues
           jq -n \
             --arg repo "${{ github.repository }}" \
             --arg path "${{ github.event.inputs.file_path }}" \
             --rawfile code "${{ github.event.inputs.file_path }}" \
             --arg lang "python" \
             '{repo: $repo, file_path: $path, code: $code, language: $lang}' > payload.json
+          
+          echo "Payload generated successfully."
 
       - name: POST to DevSecure Worker
         env:
           WORKER_SECRET: ${{ secrets.DEVSECURE_WORKER_SECRET }}
         run: |
-          # The URL MUST come after the options or be explicitly marked with --url
-          # Using @payload.json ensures curl handles the multi-line data perfectly
-          curl --request POST "https://devsecure-orchestrator.quadri-jay.workers.dev/remediate" \
-               --header "Content-Type: application/json" \
-               --header "Authorization: Bearer $WORKER_SECRET" \
-               --data @payload.json \
-               --verbose \
-               --output response.json
+          HTTP_STATUS=$(curl --silent --show-error \
+            --output response.json \
+            --write-out "%{http_code}" \
+            --request POST "https://devsecure-orchestrator.quadri-jay.workers.dev/remediate" \
+            --header "Content-Type: application/json" \
+            --header "Authorization: Bearer $WORKER_SECRET" \
+            --data @payload.json)
+          
+          echo "HTTP status: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            cat response.json
+            exit 1
+          fi
+
+      - name: Job Summary
+        run: |
+          ACTION=$(jq -r '.action // "unknown"' response.json)
+          GITHUB_URL=$(jq -r '.github_url // "N/A"' response.json)
+          CWE=$(jq -r '.classification.cwe_id // "N/A"' response.json)
+          
+          echo "## DevSecure Result" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Action** | \`$ACTION\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **CWE** | $CWE |" >> $GITHUB_STEP_SUMMARY
+          echo "| **GitHub URL** | $GITHUB_URL |" >> $GITHUB_STEP_SUMMARY
