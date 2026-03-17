@@ -26,6 +26,7 @@ interface RemediationRequest {
   code: string;         // raw vulnerable source code
   language: string;     // "python" | "javascript" | etc.
   base_branch?: string; // branch to target, defaults to "main"
+  cve_id?: string;      // optional CVE ID for RPS scoring, e.g. "CVE-2024-1234"
 }
 
 interface ClassificationResult {
@@ -38,7 +39,7 @@ interface ClassificationResult {
 
 interface RemediationResult {
   status: "fixed" | "cannot_fix";
-  fixed_code?: string;
+  fixed_code_base64?: string;
   reason?: string;
 }
 
@@ -166,10 +167,15 @@ async function remediate(
 
 Your task: produce the minimal security fix — only change what is required to eliminate the vulnerability.
 
-Return ONLY a valid JSON object. No prose. No markdown. No explanation outside the JSON.
+CRITICAL OUTPUT RULES:
+- Return ONLY valid JSON
+- Encode the entire fixed code using base64
+- Do NOT return raw code in any field
+- Do NOT include backticks or markdown
+- Ensure JSON is strictly parseable
 
 If you can fix the vulnerability with confidence ≥ 0.75 and a minimal diff:
-{"status":"fixed","fixed_code":"<complete corrected code block, preserving all logic and formatting>"}
+{"status":"fixed","fixed_code_base64":"<base64 encoded complete corrected code block>"}
 
 Otherwise (low confidence, architectural issue, or insufficient context):
 {"status":"cannot_fix","reason":"<concise explanation for the L4 human reviewer>"}
@@ -202,9 +208,300 @@ ${code}
 
   const match = raw.match(/\{[\s\S]*\}/);
   if (!match) {
-    throw new Error(`Qwen3 remediation did not return JSON. Raw output: ${raw}`);
+    console.error("RAW LLM OUTPUT:", raw);
+    throw new Error(`Remediation model did not return JSON. Raw output: ${raw}`);
   }
-  return JSON.parse(match[0]) as RemediationResult;
+  let result: RemediationResult;
+  try {
+    result = JSON.parse(match[0]) as RemediationResult;
+  } catch (e) {
+    console.error("RAW LLM OUTPUT:", raw);
+    throw new Error(`Remediation JSON parse failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Schema validation
+// ---------------------------------------------------------------------------
+
+function validateRemediation(result: RemediationResult): void {
+  if (!result || !result.status) {
+    throw new Error("Invalid remediation: missing status");
+  }
+  if (result.status !== "fixed" && result.status !== "cannot_fix") {
+    throw new Error(`Invalid remediation: unknown status "${result.status}"`);
+  }
+  if (result.status === "fixed") {
+    if (!result.fixed_code_base64 || result.fixed_code_base64.trim() === "") {
+      throw new Error("Invalid remediation: fixed_code_base64 is missing or empty");
+    }
+  }
+  if (result.status === "cannot_fix") {
+    if (!result.reason || result.reason.trim() === "") {
+      throw new Error("Invalid remediation: reason is missing or empty");
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-retry wrapper (max 2 attempts)
+// ---------------------------------------------------------------------------
+
+async function remediateWithRetry(
+  code: string,
+  language: string,
+  classification: ClassificationResult,
+  ragContext: string,
+  apiKey: string,
+  env: Env,
+): Promise<RemediationResult> {
+  const MAX_ATTEMPTS = 2;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      console.log("Remediation attempt:", attempt);
+      const result = await remediate(code, language, classification, ragContext, apiKey, env);
+      validateRemediation(result);
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`Schema validation failed on attempt ${attempt}:`, msg);
+      if (attempt === MAX_ATTEMPTS) {
+        console.error("Remediation retry exhausted after", MAX_ATTEMPTS, "attempts. Last error:", msg);
+        throw err;
+      }
+      console.log(`Retrying remediation (attempt ${attempt + 1} of ${MAX_ATTEMPTS})...`);
+    }
+  }
+  throw new Error("remediateWithRetry: exhausted attempts");
+}
+
+// ---------------------------------------------------------------------------
+// Patch Guard — diff size check
+// ---------------------------------------------------------------------------
+
+interface PatchGuardResult {
+  allowed: boolean;
+  originalLines: number;
+  fixedLines: number;
+  changedLines: number;
+  changePercent: number;
+  reason?: string;
+}
+
+function checkPatchGuard(original: string, fixed: string): PatchGuardResult {
+  const originalLines = original.split("\n");
+  const fixedLines = fixed.split("\n");
+  const originalCount = originalLines.length;
+  const fixedCount = fixedLines.length;
+  const originalBytes = original.length;
+  const fixedBytes = fixed.length;
+
+  // Line-based diff: count lines not present in the other set (symmetric diff)
+  const originalSet = new Map<string, number>();
+  for (const line of originalLines) {
+    originalSet.set(line, (originalSet.get(line) ?? 0) + 1);
+  }
+  const fixedSet = new Map<string, number>();
+  for (const line of fixedLines) {
+    fixedSet.set(line, (fixedSet.get(line) ?? 0) + 1);
+  }
+  let changedLines = 0;
+  for (const [line, count] of originalSet) {
+    const fixedCount2 = fixedSet.get(line) ?? 0;
+    if (count > fixedCount2) changedLines += count - fixedCount2;
+  }
+  for (const [line, count] of fixedSet) {
+    const origCount2 = originalSet.get(line) ?? 0;
+    if (count > origCount2) changedLines += count - origCount2;
+  }
+
+  const changePercent = originalCount > 0 ? (changedLines / originalCount) * 100 : 100;
+  const sizeRatio = originalBytes > 0 ? fixedBytes / originalBytes : Infinity;
+
+  const violations: string[] = [];
+  if (changePercent > 20) {
+    violations.push(`${changePercent.toFixed(1)}% of lines changed (limit: 20%)`);
+  }
+  if (changedLines > 50) {
+    violations.push(`${changedLines} absolute lines changed (limit: 50)`);
+  }
+  if (sizeRatio > 2) {
+    violations.push(`file size increased ${sizeRatio.toFixed(2)}x (limit: 2x)`);
+  }
+  if (sizeRatio < 0.5) {
+    violations.push(`file size decreased to ${(sizeRatio * 100).toFixed(1)}% of original (limit: 50%)`);
+  }
+
+  const allowed = violations.length === 0;
+  console.log(
+    `Patch Guard: originalLines=${originalCount} fixedLines=${fixedCount} changedLines=${changedLines} changePercent=${changePercent.toFixed(1)}% sizeRatio=${sizeRatio.toFixed(2)} allowed=${allowed}`,
+  );
+
+  return {
+    allowed,
+    originalLines: originalCount,
+    fixedLines: fixedCount,
+    changedLines,
+    changePercent,
+    reason: allowed ? undefined : `Blocked by Patch Guard: ${violations.join("; ")}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// RPS Score fetch
+// ---------------------------------------------------------------------------
+
+const RPS_DEFAULT_SCORE = 50;
+
+async function fetchRpsScore(cveId: string, env: Env): Promise<number> {
+  if (!env.RPS_API_URL) {
+    console.log(JSON.stringify({ event: "rps_fetch", status: "fallback", reason: "RPS_API_URL not configured" }));
+    return RPS_DEFAULT_SCORE;
+  }
+  try {
+    const url = `${env.RPS_API_URL}?cve_id=${encodeURIComponent(cveId)}`;
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${env.RPS_TOKEN}` },
+    });
+    if (!res.ok) {
+      console.log(JSON.stringify({ event: "rps_fetch", cve_id: cveId, status: "fallback", httpStatus: res.status }));
+      return RPS_DEFAULT_SCORE;
+    }
+    const data = (await res.json()) as Record<string, unknown>;
+    const score = data.rps_score;
+    if (typeof score !== "number") {
+      console.log(JSON.stringify({ event: "rps_fetch", cve_id: cveId, status: "fallback", reason: "missing_rps_score" }));
+      return RPS_DEFAULT_SCORE;
+    }
+    console.log(JSON.stringify({ event: "rps_fetch", cve_id: cveId, status: "success", rps_score: score }));
+    return score;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.log(JSON.stringify({ event: "rps_fetch", cve_id: cveId, status: "fallback", reason }));
+    return RPS_DEFAULT_SCORE;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Diversity Judge
+// ---------------------------------------------------------------------------
+
+const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
+const DEFAULT_JUDGE_MODEL = "gpt-4o-mini";
+const JUDGE_TIMEOUT_MS = 5000;
+
+interface JudgeVerdict {
+  verdict: "approve" | "reject";
+  confidence: number;
+  issues: string[];
+  reason: string;
+}
+
+async function judgeReview(
+  originalCode: string,
+  fixedCode: string,
+  classification: ClassificationResult,
+  env: Env,
+): Promise<JudgeVerdict> {
+  const model = env.JUDGE_MODEL || DEFAULT_JUDGE_MODEL;
+
+  const system = `You are an independent security code reviewer. You will receive an original vulnerable code snippet, a proposed fix, and a vulnerability classification.
+
+Your ONLY task is to critique the proposed fix. You MUST NOT generate new code.
+
+Return ONLY a valid JSON object. No prose. No markdown. No explanation outside the JSON.
+
+Required schema:
+{
+  "verdict": "approve" | "reject",
+  "confidence": <0.0-1.0>,
+  "issues": ["<issue description>", ...],
+  "reason": "<concise one-sentence critique>"
+}
+
+verdict rules:
+- "approve" if the fix correctly eliminates the vulnerability without breaking behaviour
+- "reject" if the fix is incomplete, incorrect, introduces new risk, or alters unrelated behaviour
+
+issues: empty array [] if no issues found.`;
+
+  const user = `## Vulnerability Classification
+\`\`\`json
+${JSON.stringify(classification, null, 2)}
+\`\`\`
+
+## Original Code
+\`\`\`
+${originalCode.slice(0, 2000)}
+\`\`\`
+
+## Proposed Fix
+\`\`\`
+${fixedCode.slice(0, 2000)}
+\`\`\``;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), JUDGE_TIMEOUT_MS);
+
+  let raw: string;
+  try {
+    const res = await fetch(OPENAI_CHAT_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.JUDGE_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+        max_tokens: 512,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Judge API error: HTTP ${res.status} — ${errText}`);
+    }
+
+    const data = (await res.json()) as { choices: Array<{ message: { content: string } }> };
+    raw = data.choices[0].message.content.trim();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) {
+    throw new Error(`Judge did not return JSON. Raw output length: ${raw.length}`);
+  }
+
+  let verdict: JudgeVerdict;
+  try {
+    verdict = JSON.parse(match[0]) as JudgeVerdict;
+  } catch (e) {
+    throw new Error(`Judge JSON parse failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  if (!verdict.verdict || (verdict.verdict !== "approve" && verdict.verdict !== "reject")) {
+    throw new Error(`Judge returned invalid verdict: "${verdict.verdict}"`);
+  }
+  if (typeof verdict.confidence !== "number") {
+    throw new Error("Judge response missing numeric confidence");
+  }
+  if (!verdict.reason || verdict.reason.trim() === "") {
+    throw new Error("Judge response missing non-empty reason");
+  }
+  if (!Array.isArray(verdict.issues)) {
+    throw new Error("Judge response missing issues array");
+  }
+
+  return verdict;
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +672,27 @@ ${classification.summary}
 }
 
 // ---------------------------------------------------------------------------
+// In-memory metrics (persists across requests within the same Worker instance)
+// ---------------------------------------------------------------------------
+
+const worker_start_time = Date.now();
+
+let metrics_total_requests        = 0;
+let metrics_pr_opened_count       = 0;
+let metrics_issue_escalated_count = 0;
+let metrics_total_final_score     = 0;
+let metrics_total_rps_score       = 0;
+
+interface RecentDecision {
+  timestamp: string;
+  repo: string;
+  cve_id: string | null;
+  final_score: number;
+  decision: "pr_opened" | "issue_escalated";
+}
+const recent_decisions: RecentDecision[] = [];
+
+// ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------
 
@@ -387,6 +705,51 @@ export default {
       return new Response(
         JSON.stringify({ status: "ok", service: "devsecure-orchestrator" }),
         { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // Live operational metrics — handled BEFORE all other routes including the POST /remediate guard
+    if (url.pathname === "/metrics") {
+      const CORS_HEADERS = {
+        "Access-Control-Allow-Origin":  "*",
+        "Access-Control-Allow-Methods": "GET",
+        "Access-Control-Allow-Headers": "*",
+      };
+
+      // CORS preflight
+      if (request.method === "OPTIONS") {
+        return new Response(null, { status: 200, headers: CORS_HEADERS });
+      }
+
+      // Only GET is supported beyond preflight
+      if (request.method !== "GET") {
+        return new Response(
+          JSON.stringify({ error: "Method not allowed." }),
+          { status: 405, headers: { "Content-Type": "application/json", ...CORS_HEADERS } },
+        );
+      }
+
+      const n = metrics_total_requests;
+      const round2 = (v: number) => Math.round(v * 100) / 100;
+      const success_rate = n === 0 ? 0 : round2((metrics_pr_opened_count / n) * 100);
+      const health_status =
+        n === 0 ? "healthy" :
+        success_rate >= 70 ? "healthy" :
+        success_rate >= 50 ? "degraded" :
+        "unhealthy";
+      return new Response(
+        JSON.stringify({
+          total_requests:   n,
+          pr_opened:        metrics_pr_opened_count,
+          issue_escalated:  metrics_issue_escalated_count,
+          success_rate,
+          avg_final_score:  n === 0 ? 0 : round2(metrics_total_final_score / n),
+          avg_rps_score:    n === 0 ? 0 : round2(metrics_total_rps_score / n),
+          uptime_seconds:   Math.round((Date.now() - worker_start_time) / 1000),
+          health_status,
+          recent_decisions,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json", ...CORS_HEADERS } },
       );
     }
 
@@ -416,6 +779,89 @@ export default {
       }
     }
 
+    // POST /ingest-fix — Learning Guard ingestion endpoint.
+    // Accepts a validated fix, embeds it, and upserts into VECTOR_INDEX.
+    // Protected by the same SEED_SECRET bearer token.
+    if (request.method === "POST" && url.pathname === "/ingest-fix") {
+      const ingestAuth = request.headers.get("Authorization");
+      if (!ingestAuth || ingestAuth !== `Bearer ${env.SEED_SECRET}`) {
+        return new Response(
+          JSON.stringify({ error: "Unauthorized." }),
+          { status: 401, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      interface IngestFixRequest {
+        cwe_id: string;
+        summary: string;
+        fixed_code: string;
+        metadata: Record<string, unknown>;
+      }
+
+      let ingestBody: IngestFixRequest;
+      try {
+        ingestBody = (await request.json()) as IngestFixRequest;
+      } catch {
+        return new Response(
+          JSON.stringify({ error: "Request body must be valid JSON." }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      const { cwe_id, summary, fixed_code, metadata } = ingestBody;
+      if (!cwe_id || !summary || !fixed_code) {
+        return new Response(
+          JSON.stringify({ error: "Missing required fields: cwe_id, summary, fixed_code." }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      try {
+        // Build embedding text: CWE context + truncated fixed code (max 1500 chars)
+        const embeddingText = `${cwe_id} fix: ${summary}\n${fixed_code.slice(0, 1500)}`;
+        const vector = await getEmbedding(embeddingText, env);
+
+        // Duplicate detection: query top-1, skip if score > 0.95
+        const dupeCheck = await env.VECTOR_INDEX.query(vector, { topK: 1, returnMetadata: "none" });
+        if (dupeCheck.matches && dupeCheck.matches.length > 0 && dupeCheck.matches[0].score > 0.95) {
+          console.log(`[ingest-fix] Duplicate detected for ${cwe_id} (score: ${dupeCheck.matches[0].score.toFixed(4)}) — skipping.`);
+          return new Response(
+            JSON.stringify({ status: "skipped", reason: "duplicate", score: dupeCheck.matches[0].score }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        const commitSha = typeof metadata.commit_sha === "string" ? metadata.commit_sha : String(Date.now());
+        const vectorId = `learn-${cwe_id.toLowerCase().replace(/[^a-z0-9-]/g, "-")}-${commitSha.slice(0, 12)}`;
+
+        await env.VECTOR_INDEX.upsert([{
+          id: vectorId,
+          values: vector,
+          metadata: {
+            cwe_id,
+            summary,
+            fixed_code: fixed_code.slice(0, 2000),
+            source: "learning-guard",
+            ingested_at: new Date().toISOString(),
+            ...metadata,
+          },
+        }]);
+
+        console.log(`[ingest-fix] Ingested ${vectorId} for ${cwe_id}.`);
+        return new Response(
+          JSON.stringify({ status: "ingested", id: vectorId }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        console.error("[ingest-fix] Ingestion failed:", detail);
+        return new Response(
+          JSON.stringify({ error: "Ingestion failed.", detail }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        );
+      }
+    }
+
     if (request.method !== "POST" || url.pathname !== "/remediate") {
       return new Response(
         JSON.stringify({ error: "Only POST /remediate is accepted." }),
@@ -434,7 +880,7 @@ export default {
       );
     }
 
-    const { repo, file_path, code, language, base_branch = "main" } = body;
+    const { repo, file_path, code, language, base_branch = "main", cve_id } = body;
 
     if (code.length > 100_000) {
       return new Response(
@@ -492,27 +938,104 @@ export default {
       }
       console.log("RAG context length:", ragContext.length);
 
-      // ── Step 3: Remediation ───────────────────────────────────────────────
+      // ── Step 3: Confidence gate (fail-closed) ─────────────────────────────
+      pipelineStep = "confidence_gate";
+      const BENIGN_PATTERNS = ["no vulnerability", "benign", "not vulnerable"];
+      const summaryLower = classification.summary.toLowerCase();
+      const cweBlocked =
+        !classification.cwe_id ||
+        classification.cwe_id.trim() === "" ||
+        classification.cwe_id === "CWE-0";
+      const confidenceBlocked = classification.confidence < 0.75;
+      const laneBlocked = classification.lane >= 3;
+      const summaryBlocked = BENIGN_PATTERNS.some((p) => summaryLower.includes(p));
+      if (confidenceBlocked || laneBlocked || cweBlocked || summaryBlocked) {
+        console.log("Blocked by confidence gate:", JSON.stringify(classification));
+        const gateReason = [
+          confidenceBlocked && `confidence=${classification.confidence} < 0.75`,
+          laneBlocked && `lane=${classification.lane} >= 3`,
+          cweBlocked && `cwe_id invalid ("${classification.cwe_id}")`,
+          summaryBlocked && `summary matched benign pattern`,
+        ].filter(Boolean).join("; ");
+        pipelineStep = "github";
+        const gateUrl = await openIssue(
+          repo,
+          file_path,
+          classification,
+          { status: "cannot_fix", reason: `Confidence gate triggered: ${gateReason}` },
+          env.GITHUB_PAT,
+        );
+        console.log("Pipeline duration:", Date.now() - start, "ms");
+        return new Response(
+          JSON.stringify({
+            action: "issue_escalated",
+            github_url: gateUrl,
+            classification,
+            remediation_status: "cannot_fix",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      // ── Step 4: Remediation ───────────────────────────────────────────────
       pipelineStep = "remediation";
       console.log("Calling remediation model: " + (env.REMEDIATION_MODEL || DEFAULT_REMEDIATION_MODEL));
-      const remediation = await remediate(
-        code,
-        language,
-        classification,
-        ragContext,
-        env.HF_API_KEY,
-        env,
-      );
-      if (remediation.status === "fixed" && remediation.fixed_code) {
-        console.log("Remediation received. Patch length: " + remediation.fixed_code.length);
+      let remediation: RemediationResult;
+      let remediationRequiredRetry = false;
+      try {
+        // Wrap remediateWithRetry to detect if attempt 1 failed and attempt 2 was needed.
+        // We monkey-patch by catching attempt-1 failure at this level without re-running.
+        let attempt1Succeeded = false;
+        try {
+          const result1 = await remediate(code, language, classification, ragContext, env.HF_API_KEY, env);
+          validateRemediation(result1);
+          remediation = result1;
+          attempt1Succeeded = true;
+        } catch {
+          remediationRequiredRetry = true;
+        }
+        if (!attempt1Succeeded) {
+          remediation = await remediateWithRetry(code, language, classification, ragContext, env.HF_API_KEY, env);
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error("Remediation exhausted retries, escalating to L4:", msg);
+        pipelineStep = "github";
+        const fallbackUrl = await openIssue(
+          repo,
+          file_path,
+          classification,
+          { status: "cannot_fix", reason: `Automated remediation failed after retries: ${msg}` },
+          env.GITHUB_PAT,
+        );
+        console.log("Pipeline duration:", Date.now() - start, "ms");
+        return new Response(
+          JSON.stringify({
+            action: "issue_escalated",
+            github_url: fallbackUrl,
+            classification,
+            remediation_status: "cannot_fix",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (remediation.status === "fixed" && remediation.fixed_code_base64) {
+        console.log("Remediation received. Base64 length: " + remediation.fixed_code_base64.length);
       } else {
         console.log("Remediation status: " + remediation.status + " — reason: " + (remediation.reason ?? "none"));
       }
 
-      // ── Step 4: Fail-closed gate ──────────────────────────────────────────
+      // ── Step 5: Fail-closed gate + Patch Guard ────────────────────────────
       pipelineStep = "github";
       let githubUrl: string;
       let action: "pr_opened" | "issue_escalated";
+      let scorePayload: {
+        rps_score: number;
+        judge_penalty: number;
+        patch_risk: number;
+        lane_weight: number;
+        final_priority_score: number;
+      } | Record<string, never> = {};
 
       if (remediation.status === "cannot_fix") {
         // L4 escalation path → open GitHub Issue
@@ -525,17 +1048,196 @@ export default {
         );
         action = "issue_escalated";
       } else {
-        // Fix path → commit + open GitHub PR
-        console.log("Attempting to open PR on repo: " + repo);
-        githubUrl = await openPr(
-          repo,
-          file_path,
-          remediation.fixed_code!,
-          classification,
-          base_branch,
-          env.GITHUB_PAT,
-        );
-        action = "pr_opened";
+        // Patch Guard: decode and check diff size before committing
+        let decoded: string;
+        let guard: PatchGuardResult;
+        try {
+          decoded = atob(remediation.fixed_code_base64!);
+          guard = checkPatchGuard(code, decoded);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error("Patch Guard calculation failed, escalating to L4:", msg);
+          githubUrl = await openIssue(
+            repo,
+            file_path,
+            classification,
+            { status: "cannot_fix", reason: `Patch Guard calculation error: ${msg}` },
+            env.GITHUB_PAT,
+          );
+          action = "issue_escalated";
+          console.log("Pipeline duration:", Date.now() - start, "ms");
+          return new Response(
+            JSON.stringify({ action, github_url: githubUrl, classification, remediation_status: "cannot_fix" }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+
+        if (!guard.allowed) {
+          console.log(
+            `Patch Guard blocked PR: ${guard.reason} | originalLines=${guard.originalLines} fixedLines=${guard.fixedLines} changedLines=${guard.changedLines} changePercent=${guard.changePercent.toFixed(1)}%`,
+          );
+          githubUrl = await openIssue(
+            repo,
+            file_path,
+            classification,
+            {
+              status: "cannot_fix",
+              reason: `${guard.reason}. Original: ${guard.originalLines} lines → Fixed: ${guard.fixedLines} lines (${guard.changePercent.toFixed(1)}% changed, ${guard.changedLines} lines modified).`,
+            },
+            env.GITHUB_PAT,
+          );
+          action = "issue_escalated";
+        } else {
+          // ── Step 5b: Diversity Judge (risk-triggered, fail-closed) ───────────
+          pipelineStep = "judge";
+          const judgeTriggerReasons: string[] = [];
+          if (classification.lane >= 3)                                judgeTriggerReasons.push("lane=" + classification.lane);
+          if (classification.confidence < 0.80)                        judgeTriggerReasons.push("confidence=" + classification.confidence);
+          if (guard.changePercent > 15 && guard.changePercent < 20)    judgeTriggerReasons.push("borderline_patch=" + guard.changePercent.toFixed(1) + "%");
+          if (remediationRequiredRetry)                                 judgeTriggerReasons.push("remediation_retried");
+          const judgeTriggered = judgeTriggerReasons.length > 0;
+
+          // Judge penalty and result — defaults for skip path
+          let judgePenalty = 0;
+          let judgeRejectReason: string | null = null;
+          let judgeFailure = false;
+
+          if (judgeTriggered) {
+            console.log(JSON.stringify({
+              event: "[JUDGE] triggered",
+              lane: classification.lane,
+              confidence: classification.confidence,
+              changePercent: guard.changePercent,
+              remediationRequiredRetry,
+              triggerReasons: judgeTriggerReasons,
+            }));
+            try {
+              const judgeResult = await judgeReview(code, decoded, classification, env);
+
+              const effectiveReject =
+                judgeResult.verdict === "reject" ||
+                judgeResult.confidence < 0.80 ||
+                judgeResult.issues.length > 0;
+
+              // Compute judge penalty component
+              if (judgeResult.verdict === "reject") {
+                judgePenalty = 20;
+              } else if (judgeResult.confidence < 0.85) {
+                judgePenalty = 10;
+              }
+
+              console.log(JSON.stringify({
+                event: effectiveReject ? "[JUDGE] verdict: reject" : "[JUDGE] verdict: approve",
+                verdict: judgeResult.verdict,
+                confidence: judgeResult.confidence,
+                issueCount: judgeResult.issues.length,
+                issues: judgeResult.issues,
+                reason: judgeResult.reason,
+                judgePenalty,
+                effectiveReject,
+              }));
+
+              if (effectiveReject) {
+                judgeRejectReason = `Diversity Judge rejected fix (verdict=${judgeResult.verdict}, confidence=${judgeResult.confidence}): ${judgeResult.reason}${judgeResult.issues.length > 0 ? " Issues: " + judgeResult.issues.join("; ") : ""}`;
+              }
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              console.error(JSON.stringify({ event: "[JUDGE] failure", error: msg, outcome: "issue_escalated" }));
+              judgeFailure = true;
+              judgeRejectReason = `Diversity Judge unavailable or invalid response: ${msg}`;
+            }
+          } else {
+            console.log(JSON.stringify({
+              event: "[JUDGE] skipped",
+              lane: classification.lane,
+              confidence: classification.confidence,
+              changePercent: guard.changePercent,
+            }));
+          }
+
+          // ── Step 5c: RPS fetch ────────────────────────────────────────────
+          pipelineStep = "rps";
+          let rpsScore: number;
+          if (cve_id) {
+            rpsScore = await fetchRpsScore(cve_id, env);
+          } else {
+            console.log(JSON.stringify({ event: "rps_fetch", status: "fallback", reason: "rps_skipped_no_cve" }));
+            rpsScore = RPS_DEFAULT_SCORE;
+          }
+
+          // ── Step 5d: Final Priority Scoring ──────────────────────────────
+          pipelineStep = "scoring";
+          const laneWeightMap: Record<number, number> = { 1: 0, 2: 5, 3: 10, 4: 20 };
+          const laneWeight = laneWeightMap[classification.lane] ?? 20;
+
+          let patchRisk: number;
+          if (guard.changePercent <= 10) {
+            patchRisk = 0;
+          } else if (guard.changePercent <= 15) {
+            patchRisk = 5;
+          } else {
+            patchRisk = 10;
+          }
+
+          const rawScore = rpsScore - judgePenalty - patchRisk - laneWeight;
+          const finalScore = Math.min(100, Math.max(0, rawScore));
+
+          console.log(JSON.stringify({
+            event: "final_scoring",
+            rps: rpsScore,
+            judge_penalty: judgePenalty,
+            lane_weight: laneWeight,
+            patch_risk: patchRisk,
+            final_score: finalScore,
+          }));
+
+          // ── Step 5e: Decision engine ──────────────────────────────────────
+          pipelineStep = "github";
+
+          // Fail-closed: judge failure or reject always escalates, score is irrelevant
+          if (judgeFailure || judgeRejectReason !== null) {
+            githubUrl = await openIssue(
+              repo, file_path, classification,
+              { status: "cannot_fix", reason: judgeRejectReason ?? "Judge failure — fail-closed escalation" },
+              env.GITHUB_PAT,
+            );
+            action = "issue_escalated";
+          } else if (finalScore >= 85) {
+            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT);
+            action = "pr_opened";
+          } else if (finalScore >= 70) {
+            console.log(JSON.stringify({ event: "final_scoring", warning: "score_in_caution_band", final_score: finalScore }));
+            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT);
+            action = "pr_opened";
+          } else {
+            githubUrl = await openIssue(
+              repo, file_path, classification,
+              { status: "cannot_fix", reason: `Final priority score too low to auto-merge: score=${finalScore} (rps=${rpsScore}, judgePenalty=${judgePenalty}, patchRisk=${patchRisk}, laneWeight=${laneWeight})` },
+              env.GITHUB_PAT,
+            );
+            action = "issue_escalated";
+          }
+
+          scorePayload = { rps_score: rpsScore, judge_penalty: judgePenalty, patch_risk: patchRisk, lane_weight: laneWeight, final_priority_score: finalScore };
+
+          // Update in-memory metrics (scoring path — has rpsScore + finalScore)
+          metrics_total_requests++;
+          if (action === "pr_opened") metrics_pr_opened_count++;
+          else metrics_issue_escalated_count++;
+          metrics_total_final_score += finalScore;
+          metrics_total_rps_score   += rpsScore;
+          recent_decisions.push({ timestamp: new Date().toISOString(), repo, cve_id: cve_id ?? null, final_score: finalScore, decision: action });
+          if (recent_decisions.length > 10) recent_decisions.shift();
+        }
+      }
+
+      // Update metrics for cannot_fix / patch-guard-blocked paths (no score computed)
+      if (Object.keys(scorePayload).length === 0 && action !== undefined) {
+        metrics_total_requests++;
+        if (action === "pr_opened") metrics_pr_opened_count++;
+        else metrics_issue_escalated_count++;
+        recent_decisions.push({ timestamp: new Date().toISOString(), repo, cve_id: cve_id ?? null, final_score: 0, decision: action });
+        if (recent_decisions.length > 10) recent_decisions.shift();
       }
 
       console.log("Pipeline duration:", Date.now() - start, "ms");
@@ -546,6 +1248,7 @@ export default {
           github_url: githubUrl,
           classification,
           remediation_status: remediation.status,
+          ...scorePayload,
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );

@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>DevSecure — Pipeline Dashboard</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0b0f14;
+  --bg-alt:#0e1219;
+  --surface:#13181f;
+  --surface-2:#181e28;
+  --surface-3:#1d2535;
+  --border:rgba(255,255,255,.06);
+  --border-hi:rgba(255,255,255,.11);
+  --text:#dce1ed;
+  --text-2:#8892a8;
+  --text-3:#4e5870;
+  --accent:#3b82f6;
+  --accent-dim:#1e3a5f;
+  --accent-glow:rgba(59,130,246,.15);
+  --green:#22c55e;
+  --green-dim:rgba(34,197,94,.12);
+  --green-bd:rgba(34,197,94,.22);
+  --amber:#f59e0b;
+  --amber-dim:rgba(245,158,11,.12);
+  --amber-bd:rgba(245,158,11,.22);
+  --red:#ef4444;
+  --red-dim:rgba(239,68,68,.12);
+  --red-bd:rgba(239,68,68,.22);
+  --blue-dim:rgba(59,130,246,.12);
+  --blue-bd:rgba(59,130,246,.22);
+  --r:12px;--r-sm:8px;--r-xs:6px;
+  --sh:0 2px 12px rgba(0,0,0,.5),0 1px 3px rgba(0,0,0,.4);
+  --sh-sm:0 1px 4px rgba(0,0,0,.35);
+}
+html{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;min-height:100vh}
+body{padding-bottom:72px}
+
+/* ─── Nav ───────────────────────────────────────────────────── */
+nav{
+  position:sticky;top:0;z-index:100;
+  height:52px;
+  background:rgba(11,15,20,.9);
+  backdrop-filter:blur(20px) saturate(160%);
+  -webkit-backdrop-filter:blur(20px) saturate(160%);
+  border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0 28px;
+  gap:16px;
+}
+.nav-brand{display:flex;align-items:center;gap:10px;text-decoration:none}
+.nav-icon{
+  width:28px;height:28px;border-radius:7px;
+  background:linear-gradient(135deg,#3b82f6,#1d4ed8);
+  display:flex;align-items:center;justify-content:center;
+  font-size:14px;flex-shrink:0;
+  box-shadow:0 0 18px rgba(59,130,246,.3);
+}
+.nav-title{font-size:14px;font-weight:700;color:var(--text);letter-spacing:-.2px}
+.nav-title em{color:var(--accent);font-style:normal}
+.nav-pill{
+  font-size:9px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;
+  padding:2px 7px;border-radius:20px;
+  background:var(--surface-3);color:var(--text-3);border:1px solid var(--border-hi);
+}
+.nav-right{display:flex;align-items:center;gap:14px}
+.live-dot{
+  width:7px;height:7px;border-radius:50%;
+  background:var(--text-3);transition:background .3s,box-shadow .3s;
+  flex-shrink:0;
+}
+.live-dot.on{background:var(--green);box-shadow:0 0 0 3px rgba(34,197,94,.18),0 0 9px rgba(34,197,94,.45)}
+.live-dot.err{background:var(--red)}
+#nav-ts{font-size:11px;color:var(--text-3)}
+
+/* ─── Page ──────────────────────────────────────────────────── */
+.page{max-width:1320px;margin:0 auto;padding:28px 24px 0}
+
+/* ─── Error bar ─────────────────────────────────────────────── */
+.err{
+  display:none;align-items:center;gap:10px;
+  padding:10px 16px;border-radius:var(--r-sm);
+  background:var(--red-dim);border:1px solid var(--red-bd);
+  color:var(--red);font-size:12.5px;font-weight:500;
+  margin-bottom:22px;
+}
+.err.show{display:flex}
+
+/* ─── Section heading ───────────────────────────────────────── */
+h2{font-size:9.5px;font-weight:700;letter-spacing:.9px;text-transform:uppercase;color:var(--text-3);margin-bottom:12px}
+
+/* ─── Metric cards ──────────────────────────────────────────── */
+.grid6{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:22px}
+@media(max-width:1100px){.grid6{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:600px) {.grid6{grid-template-columns:repeat(2,1fr)}}
+
+.card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--r);
+  padding:16px;
+  box-shadow:var(--sh-sm);
+  position:relative;overflow:hidden;
+}
+.card::before{
+  content:'';position:absolute;inset:0;
+  border-radius:inherit;
+  background:linear-gradient(135deg,rgba(59,130,246,.03),transparent 60%);
+  pointer-events:none;
+}
+.c-lbl{
+  font-size:9.5px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;
+  color:var(--text-3);margin-bottom:8px;
+}
+.c-val{font-size:28px;font-weight:800;line-height:1;letter-spacing:-.7px}
+.c-val.blue  {color:var(--accent)}
+.c-val.green {color:var(--green)}
+.c-val.amber {color:var(--amber)}
+.c-val.red   {color:var(--red)}
+.c-sub{font-size:10px;color:var(--text-3);margin-top:5px}
+
+.badge{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:4px 10px;border-radius:20px;
+  font-size:11px;font-weight:700;letter-spacing:.2px;text-transform:capitalize;
+  margin-top:6px;
+}
+.badge.healthy  {background:var(--green-dim);color:var(--green);border:1px solid var(--green-bd)}
+.badge.degraded {background:var(--amber-dim);color:var(--amber);border:1px solid var(--amber-bd)}
+.badge.unhealthy{background:var(--red-dim);color:var(--red);border:1px solid var(--red-bd)}
+.badge::before{content:'●';font-size:7px}
+
+/* ─── Panels ────────────────────────────────────────────────── */
+.panel{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:var(--r);
+  padding:20px;
+  box-shadow:var(--sh-sm);
+}
+.p-title{
+  font-size:10px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;
+  color:var(--text-2);margin-bottom:16px;
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+}
+.p-tag{
+  font-size:9px;font-weight:700;padding:2px 7px;border-radius:4px;
+  background:var(--surface-3);color:var(--text-3);border:1px solid var(--border-hi);
+}
+
+/* ─── Two / three col rows ──────────────────────────────────── */
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:22px}
+.row3{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px;margin-bottom:22px}
+@media(max-width:920px){.row2,.row3{grid-template-columns:1fr}}
+
+/* ─── Bar ───────────────────────────────────────────────────── */
+.bar-bg{height:30px;background:var(--surface-3);border-radius:var(--r-xs);overflow:hidden;border:1px solid var(--border)}
+.bar-fg{
+  height:100%;border-radius:var(--r-xs);
+  display:flex;align-items:center;padding:0 11px;
+  font-size:12px;font-weight:700;color:#fff;white-space:nowrap;
+  transition:width .65s cubic-bezier(.4,0,.2,1),background .4s;
+  min-width:38px;
+}
+
+/* ─── Stacked bar ───────────────────────────────────────────── */
+.stack{height:28px;border-radius:var(--r-xs);display:flex;overflow:hidden;border:1px solid var(--border);background:var(--surface-3)}
+.s-pr {background:var(--green);display:flex;align-items:center;padding:0 10px;font-size:11px;font-weight:700;color:#fff;white-space:nowrap;overflow:hidden;transition:width .65s ease;flex-shrink:0}
+.s-esc{flex:1;display:flex;align-items:center;padding:0 10px;font-size:11px;font-weight:700;color:var(--red);white-space:nowrap;overflow:hidden;background:var(--red-dim)}
+.leg{display:flex;gap:16px;margin-top:10px}
+.leg-i{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text-2)}
+.leg-dot{width:9px;height:9px;border-radius:3px}
+
+/* ─── Histogram ─────────────────────────────────────────────── */
+.hist{
+  display:flex;align-items:flex-end;gap:3px;
+  height:96px;padding-bottom:18px;
+  position:relative;
+}
+.hist::after{content:'';position:absolute;bottom:18px;left:0;right:0;height:1px;background:var(--border)}
+.hcol{flex:1;display:flex;flex-direction:column;align-items:center;position:relative}
+.hbar{
+  width:100%;border-radius:3px 3px 0 0;
+  background:linear-gradient(180deg,var(--accent),rgba(59,130,246,.5));
+  transition:height .55s cubic-bezier(.4,0,.2,1);
+  min-height:2px;
+}
+.hbar.zero{background:var(--surface-3)}
+.hlbl{position:absolute;bottom:-16px;font-size:8.5px;color:var(--text-3);white-space:nowrap}
+
+/* ─── Severity grid ─────────────────────────────────────────── */
+.sev-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.sev{
+  padding:12px;border-radius:var(--r-sm);
+  border:1px solid var(--border);
+  background:var(--surface-2);
+}
+.sev-lbl{font-size:9px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;margin-bottom:5px}
+.sev-val{font-size:22px;font-weight:800;line-height:1}
+.sev-hint{font-size:9.5px;color:var(--text-3);margin-top:3px}
+.sev.low  .sev-lbl,.sev.low  .sev-val{color:var(--green)}
+.sev.med  .sev-lbl,.sev.med  .sev-val{color:var(--accent)}
+.sev.high .sev-lbl,.sev.high .sev-val{color:var(--amber)}
+.sev.crit .sev-lbl,.sev.crit .sev-val{color:var(--red)}
+
+/* ─── Risk reduction ────────────────────────────────────────── */
+.rr-big{font-size:44px;font-weight:900;line-height:1;letter-spacing:-2px}
+.rr-big.pos{color:var(--green)}
+.rr-big.neg{color:var(--amber)}
+.rr-desc{font-size:11px;color:var(--text-3);margin-top:6px;line-height:1.6}
+.rr-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:16px}
+.rr-box{padding:10px;border-radius:var(--r-sm);background:var(--surface-2);border:1px solid var(--border)}
+.rr-box-lbl{font-size:9px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--text-3);margin-bottom:4px}
+.rr-box-val{font-size:18px;font-weight:700;color:var(--text)}
+
+/* ─── Table ─────────────────────────────────────────────────── */
+.tbl-wrap{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--r);box-shadow:var(--sh-sm);overflow:hidden;
+}
+.tbl-head{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 20px;border-bottom:1px solid var(--border);
+  background:var(--bg-alt);
+}
+.tbl-title{font-size:10px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:var(--text-2)}
+.tbl-ct{
+  font-size:9px;font-weight:700;padding:2px 8px;border-radius:20px;
+  background:var(--surface-3);color:var(--text-3);border:1px solid var(--border-hi);
+}
+.tbl-scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+thead th{
+  padding:9px 16px;text-align:left;
+  font-size:9.5px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
+  color:var(--text-3);border-bottom:1px solid var(--border);
+  background:var(--bg-alt);white-space:nowrap;
+}
+tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
+tbody tr:last-child{border-bottom:none}
+tbody tr.tpr {background:rgba(34,197,94,.045)}
+tbody tr.tesc{background:rgba(239,68,68,.045)}
+tbody tr.tpr:hover {background:rgba(34,197,94,.09)}
+tbody tr.tesc:hover{background:rgba(239,68,68,.09)}
+td{padding:10px 16px;font-size:12.5px;color:var(--text);white-space:nowrap;max-width:200px;overflow:hidden;text-overflow:ellipsis}
+.pill{
+  display:inline-flex;align-items:center;gap:4px;
+  padding:3px 9px;border-radius:20px;
+  font-size:10px;font-weight:700;letter-spacing:.2px;
+}
+.pill.pr {background:var(--green-dim);color:var(--green);border:1px solid var(--green-bd)}
+.pill.esc{background:var(--red-dim);color:var(--red);border:1px solid var(--red-bd)}
+.pill::before{content:'●';font-size:7px}
+.sc{display:inline-block;padding:2px 8px;border-radius:5px;font-size:11px;font-weight:700}
+.sc.h {background:var(--green-dim);color:var(--green)}
+.sc.m {background:var(--blue-dim);color:var(--accent)}
+.sc.w {background:var(--amber-dim);color:var(--amber)}
+.sc.l {background:var(--red-dim);color:var(--red)}
+.dim{color:var(--text-3)}
+.empty-row td{text-align:center;color:var(--text-3);padding:40px;font-size:12.5px}
+
+/* ─── Scrollbar ─────────────────────────────────────────────── */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--surface-3);border-radius:3px}
+</style>
+</head>
+<body>
+
+<nav>
+  <a class="nav-brand" href="#">
+    <div class="nav-icon">🛡</div>
+    <span class="nav-title">Dev<em>Secure</em></span>
+    <span class="nav-pill">Dashboard</span>
+  </a>
+  <div class="nav-right">
+    <span class="live-dot" id="dot"></span>
+    <span id="nav-ts">Connecting…</span>
+  </div>
+</nav>
+
+<div class="page">
+
+  <div class="err" id="err">
+    <span>⚠</span>
+    <span>Worker unavailable — retrying every 5 seconds</span>
+  </div>
+
+  <!-- Summary -->
+  <h2>Overview</h2>
+  <div class="grid6">
+    <div class="card"><div class="c-lbl">Total Requests</div><div class="c-val blue" id="m-total">—</div></div>
+    <div class="card"><div class="c-lbl">PRs Opened</div><div class="c-val green" id="m-pr">—</div></div>
+    <div class="card"><div class="c-lbl">Escalated</div><div class="c-val red" id="m-esc">—</div></div>
+    <div class="card">
+      <div class="c-lbl">Success Rate</div>
+      <div class="c-val" id="m-rate">—</div>
+      <div class="c-sub">PR / total requests</div>
+    </div>
+    <div class="card">
+      <div class="c-lbl">Avg Final Score</div>
+      <div class="c-val blue" id="m-score">—</div>
+      <div class="c-sub">0 – 100 scale</div>
+    </div>
+    <div class="card">
+      <div class="c-lbl">Health Status</div>
+      <div id="m-health">—</div>
+      <div class="c-sub" id="m-uptime">—</div>
+    </div>
+  </div>
+
+  <!-- Bars -->
+  <div class="row2">
+    <div class="panel">
+      <div class="p-title">Success Rate</div>
+      <div class="bar-bg">
+        <div class="bar-fg" id="bar" style="width:0%">0%</div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="p-title">Decision Split</div>
+      <div class="stack">
+        <div class="s-pr"  id="s-pr"  style="width:0%"></div>
+        <div class="s-esc" id="s-esc"></div>
+      </div>
+      <div class="leg">
+        <div class="leg-i"><div class="leg-dot" style="background:var(--green)"></div>PR Opened</div>
+        <div class="leg-i"><div class="leg-dot" style="background:var(--red)"></div>Escalated</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Risk -->
+  <h2>Risk Analysis</h2>
+  <div class="row3">
+
+    <div class="panel">
+      <div class="p-title">Score Distribution <span class="p-tag" id="hist-n">0 samples</span></div>
+      <div class="hist" id="hist"></div>
+    </div>
+
+    <div class="panel">
+      <div class="p-title">Severity Breakdown</div>
+      <div class="sev-grid">
+        <div class="sev low">
+          <div class="sev-lbl">Low</div>
+          <div class="sev-val" id="sv-low">0</div>
+          <div class="sev-hint">Score &gt; 85</div>
+        </div>
+        <div class="sev med">
+          <div class="sev-lbl">Medium</div>
+          <div class="sev-val" id="sv-med">0</div>
+          <div class="sev-hint">70 – 85</div>
+        </div>
+        <div class="sev high">
+          <div class="sev-lbl">High</div>
+          <div class="sev-val" id="sv-high">0</div>
+          <div class="sev-hint">50 – 70</div>
+        </div>
+        <div class="sev crit">
+          <div class="sev-lbl">Critical</div>
+          <div class="sev-val" id="sv-crit">0</div>
+          <div class="sev-hint">Score &lt; 50</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="p-title">Risk Reduction</div>
+      <div class="rr-big" id="rr-val">—</div>
+      <div class="rr-desc" id="rr-desc">Pipeline risk delta relative to base RPS score</div>
+      <div class="rr-row">
+        <div class="rr-box"><div class="rr-box-lbl">Avg RPS</div><div class="rr-box-val" id="rr-rps">—</div></div>
+        <div class="rr-box"><div class="rr-box-lbl">Avg Score</div><div class="rr-box-val" id="rr-score">—</div></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Decisions -->
+  <h2>Recent Decisions</h2>
+  <div class="tbl-wrap">
+    <div class="tbl-head">
+      <span class="tbl-title">Last 10 Pipeline Decisions</span>
+      <span class="tbl-ct" id="tbl-ct">0 / 10</span>
+    </div>
+    <div class="tbl-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Repo</th>
+            <th>CVE</th>
+            <th>Score</th>
+            <th>Decision</th>
+          </tr>
+        </thead>
+        <tbody id="tbody">
+          <tr class="empty-row"><td colspan="5">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const API='https://devsecure-orchestrator.quadri-jay.workers.dev/metrics';
+const INTERVAL=5000;
+const BINS=['0','10','20','30','40','50','60','70','80','90'];
+
+const $=id=>document.getElementById(id);
+const set=(id,v)=>{const e=$(id);if(e)e.textContent=v};
+const html=(id,v)=>{const e=$(id);if(e)e.innerHTML=v};
+
+const fmtTime=iso=>{try{return new Date(iso).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}catch{return'—'}};
+const fmtUp=s=>s<60?s+'s':s<3600?Math.floor(s/60)+'m '+(s%60)+'s':Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
+const rateCol=r=>r>=70?'var(--green)':r>=50?'var(--amber)':'var(--red)';
+const scClass=s=>s>=85?'h':s>=70?'m':s>=50?'w':'l';
+const sevOf=s=>s>85?'low':s>=70?'med':s>=50?'high':'crit';
+
+function renderHist(dec){
+  const bins=new Array(10).fill(0);
+  dec.forEach(d=>{
+    const s=typeof d.final_score==='number'?d.final_score:0;
+    bins[Math.min(9,Math.floor(s/10))]++;
+  });
+  const mx=Math.max(...bins,1);
+  const el=$('hist');
+  if(!el)return;
+  el.innerHTML=bins.map((c,i)=>{
+    const h=Math.round((c/mx)*74);
+    return`<div class="hcol"><div class="hbar${c===0?' zero':''}" style="height:${Math.max(h,2)}px" title="${c} in ${BINS[i]}-${+BINS[i]+9}"></div><span class="hlbl">${BINS[i]}</span></div>`;
+  }).join('');
+  set('hist-n',dec.length+' sample'+(dec.length!==1?'s':''));
+}
+
+function render(d){
+  const n  =d.total_requests  ||0;
+  const pr =d.pr_opened       ||0;
+  const esc=d.issue_escalated ||0;
+  const rt =d.success_rate    ||0;
+  const aS =d.avg_final_score ||0;
+  const aR =d.avg_rps_score   ||0;
+  const up =d.uptime_seconds  ||0;
+  const hl =d.health_status   ||'unhealthy';
+  const dec=Array.isArray(d.recent_decisions)?d.recent_decisions:[];
+
+  // Cards
+  set('m-total',n);
+  set('m-pr',pr);
+  set('m-esc',esc);
+  const rEl=$('m-rate');
+  if(rEl){rEl.textContent=rt.toFixed(1)+'%';rEl.className='c-val '+(rt>=70?'green':rt>=50?'amber':'red')}
+  set('m-score',aS.toFixed(1));
+  html('m-health',`<span class="badge ${hl}">${hl}</span>`);
+  set('m-uptime','Uptime: '+fmtUp(up));
+
+  // Rate bar
+  const bf=$('bar');
+  if(bf){bf.style.width=Math.min(rt,100)+'%';bf.style.background=rateCol(rt);bf.textContent=rt.toFixed(1)+'%'}
+
+  // Split
+  const pPct=n>0?(pr/n)*100:0;
+  const sp=$('s-pr'),se=$('s-esc');
+  if(sp&&se){sp.style.width=pPct.toFixed(1)+'%';sp.textContent=pr>0?pr+' PR':'';se.textContent=esc>0?esc+' Esc':''}
+
+  // Histogram + severity
+  renderHist(dec);
+  let sv={low:0,med:0,high:0,crit:0};
+  dec.forEach(d=>{sv[sevOf(typeof d.final_score==='number'?d.final_score:0)]++});
+  set('sv-low',sv.low);set('sv-med',sv.med);set('sv-high',sv.high);set('sv-crit',sv.crit);
+
+  // Risk reduction
+  const rr=aR-aS;
+  const rrEl=$('rr-val');
+  if(rrEl){rrEl.textContent=(rr>=0?'+':'')+rr.toFixed(1);rrEl.className='rr-big '+(rr>=0?'pos':'neg')}
+  set('rr-rps',aR.toFixed(1));set('rr-score',aS.toFixed(1));
+  set('rr-desc',rr>=0?'Pipeline is actively reducing risk exposure':'Risk is increasing — review escalation threshold');
+
+  // Table
+  set('tbl-ct',dec.length+' / 10');
+  const tb=$('tbody');
+  if(!tb)return;
+  if(!dec.length){tb.innerHTML='<tr class="empty-row"><td colspan="5">No decisions recorded yet</td></tr>';return}
+  tb.innerHTML=[...dec].reverse().map(d=>{
+    const pr=d.decision==='pr_opened';
+    const s=typeof d.final_score==='number'?d.final_score:0;
+    const sv=scClass(s);
+    return`<tr class="${pr?'tpr':'tesc'}">
+      <td>${fmtTime(d.timestamp)}</td>
+      <td title="${d.repo||''}">${d.repo||'<span class="dim">—</span>'}</td>
+      <td>${d.cve_id||'<span class="dim">—</span>'}</td>
+      <td><span class="sc ${sv}">${s.toFixed?s.toFixed(1):s}</span></td>
+      <td><span class="pill ${pr?'pr':'esc'}">${pr?'PR Opened':'Escalated'}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+async function tick(){
+  try{
+    const res=await fetch(API,{cache:'no-store'});
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const data=await res.json();
+    $('err').classList.remove('show');
+    $('dot').className='live-dot on';
+    set('nav-ts','Updated '+new Date().toLocaleTimeString());
+    render(data);
+  }catch{
+    $('err').classList.add('show');
+    $('dot').className='live-dot err';
+    set('nav-ts','Unavailable '+new Date().toLocaleTimeString());
+  }
+}
+
+tick();
+setInterval(tick,INTERVAL);
+</script>
+</body>
+</html>
