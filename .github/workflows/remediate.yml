@@ -1,96 +1,118 @@
 name: Automated Code Remediation Pipeline
 
-# Trigger this workflow only when files in the vulnerable_code/ directory are pushed
 on:
   push:
     paths:
       - 'vulnerable_code/**'
+  workflow_dispatch: # Allows manual triggering for testing
 
 jobs:
   remediate:
     name: Analyze and Fix Code
     runs-on: ubuntu-latest
-    
-    # Grant the action permission to write back to the repository
+
     permissions:
-      contents: write 
+      contents: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Required to accurately detect changed files
+          fetch-depth: 0
 
       - name: Get changed files
         id: changed-files
-        # This community action easily lists exactly which files triggered the push
-        uses: tj-actions/changed-files@v44
+        uses: tj-actions/changed-files@v45
         with:
           files: vulnerable_code/**
 
       - name: Send to Cloudflare Worker and Save Fix
         env:
           CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
+          WORKER_SECRET: ${{ secrets.DEVSECURE_WORKER_SECRET }}
         run: |
-          # Loop through every new/modified file in the vulnerable_code directory
+          # Ensure output directory exists
+          mkdir -p remediated_code
+
+          # Fail fast if secret missing
+          if [ -z "$WORKER_SECRET" ]; then
+            echo "❌ WORKER_SECRET is missing"
+            exit 1
+          fi
+
+          # Normalize Worker endpoint (handles trailing slash safely)
+          ENDPOINT="${CF_WORKER_URL%/}/remediate"
+
+          # 🔍 Debug: confirm endpoint and token are resolved before any curl call
+          echo "Calling endpoint: ${CF_WORKER_URL%/}/remediate"
+          echo "Token length: ${#WORKER_SECRET}"
+
           for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
             echo "Processing $file..."
-            
-            # Extract filename and extension to build the output path
-            filename=$(basename -- "$file")
-            extension="${filename##*.}"
-            name="${filename%.*}"
-            
-            # Apply the naming convention: sample1_fixed.py
-            fixed_filename="${name}_fixed.${extension}"
-            output_path="remediated_code/${fixed_filename}"
-            
-            # Ensure the output directory exists
-            mkdir -p remediated_code
-            
-            # Safely package the filename and code into a JSON payload using jq
-             extension="${file##*.}"
 
-             JSON_PAYLOAD=$(jq -n \
-               --arg repo "${{ github.repository }}" \
-               --arg path "$file" \
-               --rawfile code "$file" \
-               --arg lang "$extension" \
+            filename=$(basename -- "$file")
+            extension="${file##*.}"
+            name="${filename%.*}"
+            output_path="remediated_code/${name}_fixed.${extension}"
+
+            # Safely package the payload
+            JSON_PAYLOAD=$(jq -n \
+              --arg repo "${{ github.repository }}" \
+              --arg path "$file" \
+              --rawfile code "$file" \
+              --arg lang "$extension" \
               '{repo: $repo, file_path: $path, code: $code, language: $lang}')
-            
-            echo "Sending $filename to Cloudflare Worker orchestration layer..."
-            
-            # Call the Cloudflare Worker via POST request
-            # We save the HTTP status code to check for success, and output the response to response.json
-            HTTP_STATUS=$(curl -s -w "%{http_code}" -o response.json -X POST -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "$CF_WORKER_URL")
-            
+
+            echo "Sending $filename to Orchestrator..."
+
+            # POST to Worker with Authorization header
+            HTTP_STATUS=$(curl -s -w "%{http_code}" -o response.json \
+              -X POST \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $WORKER_SECRET" \
+              -H "X-Trace-Id: gha-${GITHUB_RUN_ID}-${RANDOM}" \
+              -d "$JSON_PAYLOAD" \
+              "$ENDPOINT")
+
+            echo "HTTP Status: $HTTP_STATUS"
+            echo "Worker response:"
+            cat response.json
+
             if [ "$HTTP_STATUS" -eq 200 ]; then
-              echo "✅ Remediation successful for $filename!"
-              # Extract the fixed code from the Worker's JSON response and save it to the output path
-              jq -r '.fixed_code' response.json > "$output_path"
-              echo "Saved remediated code to $output_path"
+              ACTION=$(jq -r '.action // "unknown"' response.json)
+              CWE=$(jq -r '.classification.cwe_id // "N/A"' response.json)
+
+              echo "✅ Worker Result: $ACTION (CWE: $CWE)"
+
+              if [ "$ACTION" == "pr_opened" ]; then
+                # Extract the fix from the remediation object
+                jq -r '.remediation.fixed_code // .fixed_code // empty' response.json > "$output_path"
+                echo "💾 Patch saved to $output_path"
+              elif [ "$ACTION" == "issue_escalated" ]; then
+                echo "⚠️ Escalated to L4 Manual Queue. No local file generated."
+                rm -f "$output_path"
+              fi
             else
-              echo "❌ Failed to remediate $filename. HTTP Status: $HTTP_STATUS"
+              echo "❌ Worker Auth/Communication Failure. Status: $HTTP_STATUS"
               cat response.json
-              exit 1 # Fail the action so you are notified of the error
+              exit 1
             fi
           done
 
       - name: Commit and Push Remediated Code
+        env:
+          # Opt-in to Node 24 to clear deprecation warnings
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: |
-          # Configure git as the GitHub Actions bot
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          
-          # Stage the newly created files
+
           git add remediated_code/
-          
-          # Check if there are actually changes to commit (prevents empty commit errors)
-          if git diff-index --quiet HEAD --; then
-            echo "No new remediations to commit."
+
+          if git diff --cached --quiet; then
+            echo "No new remediations to commit (likely escalated or no changes)."
           else
-            # The [skip ci] tag prevents this commit from accidentally triggering other workflows
-            git commit -m "Automated remediation: Added fixed code from Hugging Face AI [skip ci]"
+            git commit -m "fix(security): automated remediation patch [skip ci]"
             git push
-            echo "🎉 Successfully pushed remediated code to the repository!"
+            echo "🎉 Pushed remediated code to repository."
           fi

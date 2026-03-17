@@ -139,7 +139,7 @@ jobs:
           # Build a grep pattern from the comma-separated list
           PATTERN=$(echo "$SENSITIVE_PATTERNS" \
             | tr ',' '\n' \
-            | sed 's/\./\\./g; s/\*/[^/]*/g' \
+            | sed 's|\.|\\.|g; s|\*|[^/]*|g' \
             | paste -sd '|')
 
           VIOLATIONS=$(echo "$CHANGED" | grep -E "(^|/)($PATTERN)$" || true)
