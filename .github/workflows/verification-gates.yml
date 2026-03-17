@@ -1,0 +1,242 @@
+name: DevSecure Verification Gates
+
+on:
+  pull_request:
+    branches-ignore: []   # evaluated via the concurrency filter below
+    # Only run for devsecure/ fix branches
+    # (branch filter on PR source branch is handled via the concurrency group
+    #  and the if: conditions on each job below)
+
+concurrency:
+  # One gate run per PR branch at a time.
+  # If the AI pushes a second commit to the same fix branch, the in-flight
+  # run is cancelled and a fresh one starts.
+  group: devsecure-gates-${{ github.head_ref }}
+  cancel-in-progress: true
+
+# ---------------------------------------------------------------------------
+# Job 1 — Tier A: Syntax / Lint
+# ---------------------------------------------------------------------------
+jobs:
+  syntax:
+    name: "Tier A · Syntax & Lint"
+    if: startsWith(github.head_ref, 'devsecure/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Detect changed files
+        id: changed
+        run: |
+          # List files changed in this PR relative to the base branch
+          git fetch origin ${{ github.base_ref }} --depth=1
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "Changed files:"
+          echo "$CHANGED"
+
+      - name: Set up Python (if .py files changed)
+        if: contains(steps.changed.outputs.files, '.py')
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python syntax check
+        if: contains(steps.changed.outputs.files, '.py')
+        run: |
+          echo "${{ steps.changed.outputs.files }}" \
+            | grep '\.py$' \
+            | xargs -r python -m py_compile
+          echo "✔ Python syntax OK"
+
+      - name: Set up Node (if .js/.ts files changed)
+        if: >
+          contains(steps.changed.outputs.files, '.js') ||
+          contains(steps.changed.outputs.files, '.ts')
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: JavaScript / TypeScript syntax check
+        if: >
+          contains(steps.changed.outputs.files, '.js') ||
+          contains(steps.changed.outputs.files, '.ts')
+        run: |
+          # Lightweight parse-only check — no build toolchain required
+          echo "${{ steps.changed.outputs.files }}" \
+            | grep -E '\.(js|ts)$' \
+            | xargs -r node --input-type=module -e '
+                const fs = require("fs");
+                process.argv.slice(1).forEach(f => {
+                  try { new Function(fs.readFileSync(f,"utf8")); }
+                  catch(e) { console.error("Syntax error in", f, e.message); process.exit(1); }
+                });
+              ' -- 2>/dev/null || \
+          npx --yes acorn --ecma2022 --module \
+            $(echo "${{ steps.changed.outputs.files }}" | grep -E '\.(js|ts)$' | tr '\n' ' ') \
+            > /dev/null
+          echo "✔ JS/TS syntax OK"
+
+      - name: Shell script syntax check
+        if: contains(steps.changed.outputs.files, '.sh')
+        run: |
+          echo "${{ steps.changed.outputs.files }}" \
+            | grep '\.sh$' \
+            | xargs -r bash -n
+          echo "✔ Shell syntax OK"
+
+      - name: No recognised source files changed
+        if: >
+          !contains(steps.changed.outputs.files, '.py') &&
+          !contains(steps.changed.outputs.files, '.js') &&
+          !contains(steps.changed.outputs.files, '.ts') &&
+          !contains(steps.changed.outputs.files, '.sh')
+        run: |
+          echo "No Python/JS/TS/Shell files in diff — syntax gate skipped."
+
+# ---------------------------------------------------------------------------
+# Job 2 — Tier A: Safety / Sensitive-file guard
+# ---------------------------------------------------------------------------
+  safety:
+    name: "Tier A · Sensitive File Guard"
+    if: startsWith(github.head_ref, 'devsecure/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Sensitive file diff check
+        env:
+          # Comma-separated list of patterns that are never allowed in an
+          # AI-generated fix PR unless the ALLOW_SENSITIVE_CHANGES secret is
+          # set to "true" by a human operator.
+          SENSITIVE_PATTERNS: "auth.py,auth_module.js,.env,.env.*,secrets.*,credentials.*,*.pem,*.key,*.p12,*.pfx,shadow,passwd"
+          ALLOW_SENSITIVE_CHANGES: ${{ secrets.ALLOW_SENSITIVE_CHANGES }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin ${{ github.base_ref }} --depth=1
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+
+          echo "=== Files changed in this PR ==="
+          echo "$CHANGED"
+          echo ""
+
+          # Build a grep pattern from the comma-separated list
+          PATTERN=$(echo "$SENSITIVE_PATTERNS" \
+            | tr ',' '\n' \
+            | sed 's/\./\\./g; s/\*/[^/]*/g' \
+            | paste -sd '|')
+
+          VIOLATIONS=$(echo "$CHANGED" | grep -E "(^|/)($PATTERN)$" || true)
+
+          if [ -z "$VIOLATIONS" ]; then
+            echo "✔ No sensitive files modified."
+            exit 0
+          fi
+
+          echo "::warning::Sensitive files detected in AI-generated PR:"
+          echo "$VIOLATIONS" | while read -r f; do
+            echo "  ⚠ $f"
+          done
+
+          if [ "${ALLOW_SENSITIVE_CHANGES:-false}" = "true" ]; then
+            echo ""
+            echo "ALLOW_SENSITIVE_CHANGES=true — override acknowledged by human operator."
+            echo "Proceeding with warning only."
+            exit 0
+          fi
+
+          echo ""
+          echo "::error::AI-generated fix touched sensitive files without operator approval."
+          echo "Set the ALLOW_SENSITIVE_CHANGES repository secret to 'true' to override."
+          exit 1
+
+# ---------------------------------------------------------------------------
+# Job 3 — Tier B: Tests (runs after both Tier A gates pass)
+# ---------------------------------------------------------------------------
+  tests:
+    name: "Tier B · Full Test Suite"
+    if: startsWith(github.head_ref, 'devsecure/')
+    needs: [syntax, safety]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # ── Python ─────────────────────────────────────────────────────────────
+      - name: Detect project type
+        id: project
+        run: |
+          [ -f "requirements.txt" ] || [ -f "pyproject.toml" ] || [ -f "setup.py" ] \
+            && echo "python=true" >> "$GITHUB_OUTPUT" || echo "python=false" >> "$GITHUB_OUTPUT"
+          [ -f "package.json" ] \
+            && echo "node=true" >> "$GITHUB_OUTPUT" || echo "node=false" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: steps.project.outputs.python == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        if: steps.project.outputs.python == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
+          [ -f pyproject.toml ]   && pip install -e ".[test]" 2>/dev/null || true
+
+      - name: Run pytest
+        if: steps.project.outputs.python == 'true'
+        run: |
+          # Placeholder: replace with your actual test command / markers
+          if python -m pytest --version &>/dev/null; then
+            python -m pytest --tb=short -q
+          else
+            echo "::notice::pytest not installed — placeholder test gate passed."
+          fi
+
+      # ── Node ───────────────────────────────────────────────────────────────
+      - name: Set up Node
+        if: steps.project.outputs.node == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install Node dependencies
+        if: steps.project.outputs.node == 'true'
+        run: npm ci --prefer-offline
+
+      - name: Run npm test
+        if: steps.project.outputs.node == 'true'
+        run: |
+          # Placeholder: replace with your actual test script
+          if npm run test --if-present 2>&1 | grep -q "Missing script"; then
+            echo "::notice::No 'test' script in package.json — placeholder test gate passed."
+          else
+            npm test
+          fi
+
+      # ── Neither detected ───────────────────────────────────────────────────
+      - name: No test runner detected
+        if: >
+          steps.project.outputs.python == 'false' &&
+          steps.project.outputs.node == 'false'
+        run: |
+          echo "::notice::No Python or Node project detected. Test gate is a no-op for this repo."
+          echo "Add requirements.txt / pyproject.toml or package.json to enable automatic test runs."

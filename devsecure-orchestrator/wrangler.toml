@@ -1,0 +1,16 @@
+name = "devsecure-orchestrator"
+main = "src/index.ts"
+compatibility_date = "2025-03-16"
+compatibility_flags = ["nodejs_compat"]
+
+# Secrets (set values via CLI — never commit actual keys):
+#   wrangler secret put GITHUB_PAT
+#   wrangler secret put HF_API_KEY
+#   wrangler secret put SEED_SECRET
+
+[ai]
+binding = "AI"
+
+[[vectorize]]
+binding = "VECTOR_INDEX"
+index_name = "cwe-knowledge-base"
