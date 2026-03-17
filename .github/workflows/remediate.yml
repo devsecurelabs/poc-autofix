@@ -48,7 +48,7 @@ jobs:
 
             # Extract filename and extension to build the output path
             filename=$(basename -- "$file")
-            extension="${filename##*.}"
+            extension="${file##*.}"
             name="${filename%.*}"
 
             # Apply the naming convention: sample1_fixed.py
@@ -66,6 +66,10 @@ jobs:
               --rawfile code "$file" \
               --arg lang    "$extension" \
               '{repo: $repo, file_path: $path, code: $code, language: $lang}' > payload.json
+
+            # Debug: log payload shape without the code field to keep logs readable
+            echo "Payload check (code omitted):"
+            jq 'del(.code)' payload.json
 
             echo "Sending $filename to $ENDPOINT..."
 
