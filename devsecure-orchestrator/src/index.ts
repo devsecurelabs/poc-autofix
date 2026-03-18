@@ -20,13 +20,27 @@ const GITHUB_API = "https://api.github.com";
 // Request / Response shapes
 // ---------------------------------------------------------------------------
 
+interface DsDetection {
+  type: string;       // detection rule type
+  rule_id: string;    // unique rule identifier
+  cwe_hint?: string;  // optional CWE hint — never used as final CWE value
+  cve_id?: string;    // optional CVE ID — attached to output if present, never inferred
+}
+
+interface CodeContext {
+  snippet: string;    // source code to analyse
+  language: string;   // language identifier
+}
+
 interface RemediationRequest {
   repo: string;         // "owner/repo-name"
   file_path: string;    // relative path in repo, e.g. "src/auth.py"
-  code: string;         // raw vulnerable source code
-  language: string;     // "python" | "javascript" | etc.
+  code: string;         // raw vulnerable source code (legacy field)
+  language: string;     // "python" | "javascript" | etc. (legacy field)
   base_branch?: string; // branch to target, defaults to "main"
-  cve_id?: string;      // optional CVE ID for RPS scoring, e.g. "CVE-2024-1234"
+  cve_id?: string;      // top-level CVE ID for RPS scoring (legacy field)
+  ds_detection?: DsDetection;  // normalized detection input layer
+  code_context?: CodeContext;  // normalized code input layer
 }
 
 interface ClassificationResult {
@@ -35,6 +49,13 @@ interface ClassificationResult {
   confidence: number;   // 0.0 – 1.0
   lane: number;         // 1 = trivial → 4 = architectural / cannot assess
   summary: string;      // one-sentence description
+}
+
+// HiddenSignalLayer — internal only; never serialised to API responses or full logs
+interface HiddenSignalLayer {
+  source_type: string;     // detection origin (e.g. "sast", "dast", "manual")
+  cwe_hint?: string;       // vendor-supplied CWE; used only for mismatch detection
+  cve_id?: string;         // CVE from detection; used only for RPS lookup
 }
 
 interface RemediationResult {
@@ -682,6 +703,7 @@ let metrics_pr_opened_count       = 0;
 let metrics_issue_escalated_count = 0;
 let metrics_total_final_score     = 0;
 let metrics_total_rps_score       = 0;
+let metrics_mismatch_count        = 0;
 
 interface RecentDecision {
   timestamp: string;
@@ -708,50 +730,6 @@ export default {
       );
     }
 
-    // Live operational metrics — handled BEFORE all other routes including the POST /remediate guard
-    if (url.pathname === "/metrics") {
-      const CORS_HEADERS = {
-        "Access-Control-Allow-Origin":  "*",
-        "Access-Control-Allow-Methods": "GET",
-        "Access-Control-Allow-Headers": "*",
-      };
-
-      // CORS preflight
-      if (request.method === "OPTIONS") {
-        return new Response(null, { status: 200, headers: CORS_HEADERS });
-      }
-
-      // Only GET is supported beyond preflight
-      if (request.method !== "GET") {
-        return new Response(
-          JSON.stringify({ error: "Method not allowed." }),
-          { status: 405, headers: { "Content-Type": "application/json", ...CORS_HEADERS } },
-        );
-      }
-
-      const n = metrics_total_requests;
-      const round2 = (v: number) => Math.round(v * 100) / 100;
-      const success_rate = n === 0 ? 0 : round2((metrics_pr_opened_count / n) * 100);
-      const health_status =
-        n === 0 ? "healthy" :
-        success_rate >= 70 ? "healthy" :
-        success_rate >= 50 ? "degraded" :
-        "unhealthy";
-      return new Response(
-        JSON.stringify({
-          total_requests:   n,
-          pr_opened:        metrics_pr_opened_count,
-          issue_escalated:  metrics_issue_escalated_count,
-          success_rate,
-          avg_final_score:  n === 0 ? 0 : round2(metrics_total_final_score / n),
-          avg_rps_score:    n === 0 ? 0 : round2(metrics_total_rps_score / n),
-          uptime_seconds:   Math.round((Date.now() - worker_start_time) / 1000),
-          health_status,
-          recent_decisions,
-        }),
-        { status: 200, headers: { "Content-Type": "application/json", ...CORS_HEADERS } },
-      );
-    }
 
     // Seed the Vectorize index with PoC Top 5 CWE guidance (one-shot, idempotent).
     // Protected: requires the SEED_SECRET bearer token so the public cannot overwrite the DB.
@@ -862,6 +840,49 @@ export default {
       }
     }
 
+    if (request.method === "GET" && url.pathname === "/metrics") {
+      return new Response(
+        JSON.stringify({
+          total_requests: metrics_total_requests,
+          pr_opened: metrics_pr_opened_count,
+          issue_escalated: metrics_issue_escalated_count,
+          success_rate:
+            metrics_total_requests === 0
+              ? 0
+              : Math.round((metrics_pr_opened_count / metrics_total_requests) * 10000) / 100,
+          avg_final_score:
+            metrics_total_requests === 0
+              ? 0
+              : Math.round((metrics_total_final_score / metrics_total_requests) * 100) / 100,
+          avg_rps_score:
+            metrics_total_requests === 0
+              ? 0
+              : Math.round((metrics_total_rps_score / metrics_total_requests) * 100) / 100,
+          uptime_seconds: Math.floor((Date.now() - worker_start_time) / 1000),
+          health_status:
+            metrics_total_requests === 0
+              ? "healthy"
+              : metrics_pr_opened_count / metrics_total_requests >= 0.7
+              ? "healthy"
+              : metrics_pr_opened_count / metrics_total_requests >= 0.5
+              ? "degraded"
+              : "unhealthy",
+          recent_decisions,
+          mismatch_rate:
+            metrics_total_requests === 0
+              ? 0
+              : Math.round((metrics_mismatch_count / metrics_total_requests) * 10000) / 100,
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        },
+      );
+    }
+
     if (request.method !== "POST" || url.pathname !== "/remediate") {
       return new Response(
         JSON.stringify({ error: "Only POST /remediate is accepted." }),
@@ -880,7 +901,30 @@ export default {
       );
     }
 
-    const { repo, file_path, code, language, base_branch = "main", cve_id } = body;
+    const { repo, file_path, base_branch = "main", ds_detection, code_context } = body;
+
+    // Resolve effective inputs: code_context takes precedence over legacy fields
+    const code     = code_context?.snippet  ?? body.code;
+    const language = code_context?.language ?? body.language;
+    // CVE: ds_detection.cve_id takes precedence over top-level cve_id; never inferred
+    const cve_id   = ds_detection?.cve_id   ?? body.cve_id;
+
+    // ── Hidden Signal Layer — internal context; never exposed in API responses ─
+    const hsl: HiddenSignalLayer = {
+      source_type: ds_detection?.type ?? "unknown",
+      cwe_hint:    ds_detection?.cwe_hint,
+      cve_id:      cve_id,
+    };
+
+    if (!code || !language) {
+      return new Response(
+        JSON.stringify({
+          error: "Missing required fields.",
+          required: ["code_context.snippet + code_context.language", "or legacy: code + language"],
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
 
     if (code.length > 100_000) {
       return new Response(
@@ -889,14 +933,24 @@ export default {
       );
     }
 
-    if (!repo || !file_path || !code || !language) {
+    if (!repo || !file_path) {
       return new Response(
         JSON.stringify({
           error: "Missing required fields.",
-          required: ["repo", "file_path", "code", "language"],
+          required: ["repo", "file_path"],
         }),
         { status: 400, headers: { "Content-Type": "application/json" } },
       );
+    }
+
+    // Validate ds_detection required fields when provided
+    if (ds_detection !== undefined) {
+      if (!ds_detection.type || !ds_detection.rule_id) {
+        return new Response(
+          JSON.stringify({ error: "ds_detection requires type and rule_id." }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        );
+      }
     }
 
     // 🔍 DEBUG TRACE + REQUEST LOGGING
@@ -921,6 +975,28 @@ export default {
       pipelineStep = "classification";
       const classification = await classify(code, language, env.HF_API_KEY, env);
       console.log("Classification result:", JSON.stringify(classification));
+
+      // ── ds_detection mismatch: hint exists and differs from LLM-derived CWE ─
+      const cwe_mismatch = !!(
+        ds_detection?.cwe_hint &&
+        ds_detection.cwe_hint !== classification.cwe_id
+      );
+
+      // Lane adjustment: mismatch forces lane to at least 3 (never overrides LLM classification)
+      if (cwe_mismatch) {
+        classification.lane = Math.max(classification.lane, 3);
+        console.log(JSON.stringify({
+          event: "cwe_mismatch_detected",
+          llm_cwe: classification.cwe_id,
+          lane: classification.lane,
+          decision: "judge_forced",
+        }));
+      }
+
+      // ── Explainability factors — accumulated throughout pipeline ───────────
+      const explainabilityFactors: string[] = [];
+      if (cwe_mismatch)                     explainabilityFactors.push("cwe_mismatch");
+      if (classification.confidence < 0.80) explainabilityFactors.push("low_confidence");
 
       // ── Step 2: RAG context retrieval (Vectorize + CF AI embeddings) ───────
       pipelineStep = "rag";
@@ -1029,11 +1105,13 @@ export default {
       pipelineStep = "github";
       let githubUrl: string;
       let action: "pr_opened" | "issue_escalated";
+      let judgeWasRun = false;
       let scorePayload: {
         rps_score: number;
         judge_penalty: number;
         patch_risk: number;
         lane_weight: number;
+        mismatch_penalty: number;
         final_priority_score: number;
       } | Record<string, never> = {};
 
@@ -1095,6 +1173,7 @@ export default {
           if (classification.confidence < 0.80)                        judgeTriggerReasons.push("confidence=" + classification.confidence);
           if (guard.changePercent > 15 && guard.changePercent < 20)    judgeTriggerReasons.push("borderline_patch=" + guard.changePercent.toFixed(1) + "%");
           if (remediationRequiredRetry)                                 judgeTriggerReasons.push("remediation_retried");
+          if (cwe_mismatch)                                             judgeTriggerReasons.push("cwe_mismatch");
           const judgeTriggered = judgeTriggerReasons.length > 0;
 
           // Judge penalty and result — defaults for skip path
@@ -1112,19 +1191,27 @@ export default {
               triggerReasons: judgeTriggerReasons,
             }));
             try {
+              judgeWasRun = true;
               const judgeResult = await judgeReview(code, decoded, classification, env);
 
-              const effectiveReject =
-                judgeResult.verdict === "reject" ||
-                judgeResult.confidence < 0.80 ||
-                judgeResult.issues.length > 0;
+              // Strict mode when cwe_mismatch: require explicit approve + confidence >= 0.85 + no issues
+              const effectiveReject = cwe_mismatch
+                ? (judgeResult.verdict !== "approve" || judgeResult.confidence < 0.85 || judgeResult.issues.length > 0)
+                : (judgeResult.verdict === "reject" || judgeResult.confidence < 0.80 || judgeResult.issues.length > 0);
 
-              // Compute judge penalty component
+              // Judge penalty: verdict-based + confidence gap + issue count (capped at 15)
               if (judgeResult.verdict === "reject") {
-                judgePenalty = 20;
+                judgePenalty += 20;
               } else if (judgeResult.confidence < 0.85) {
-                judgePenalty = 10;
+                judgePenalty += 10;
               }
+              if (judgeResult.issues.length > 0) {
+                judgePenalty += Math.min(judgeResult.issues.length * 5, 15);
+              }
+
+              // Explainability factors from judge output
+              if (judgeResult.verdict === "reject")  explainabilityFactors.push("judge_reject");
+              if (judgeResult.issues.length > 0)     explainabilityFactors.push("judge_issues");
 
               console.log(JSON.stringify({
                 event: effectiveReject ? "[JUDGE] verdict: reject" : "[JUDGE] verdict: approve",
@@ -1179,7 +1266,17 @@ export default {
             patchRisk = 10;
           }
 
-          const rawScore = rpsScore - judgePenalty - patchRisk - laneWeight;
+          // Dynamic mismatch penalty — scaled by |llm_confidence – detection_baseline|
+          const DETECTION_CONFIDENCE_BASELINE = 0.7;
+          let mismatchPenalty = 0;
+          if (cwe_mismatch) {
+            const delta = Math.abs(classification.confidence - DETECTION_CONFIDENCE_BASELINE);
+            if (delta < 0.2)      mismatchPenalty = 5;
+            else if (delta <= 0.5) mismatchPenalty = 10;
+            else                   mismatchPenalty = 15;
+          }
+
+          const rawScore = rpsScore - judgePenalty - patchRisk - laneWeight - mismatchPenalty;
           const finalScore = Math.min(100, Math.max(0, rawScore));
 
           console.log(JSON.stringify({
@@ -1188,6 +1285,7 @@ export default {
             judge_penalty: judgePenalty,
             lane_weight: laneWeight,
             patch_risk: patchRisk,
+            mismatch_penalty: mismatchPenalty,
             final_score: finalScore,
           }));
 
@@ -1212,16 +1310,17 @@ export default {
           } else {
             githubUrl = await openIssue(
               repo, file_path, classification,
-              { status: "cannot_fix", reason: `Final priority score too low to auto-merge: score=${finalScore} (rps=${rpsScore}, judgePenalty=${judgePenalty}, patchRisk=${patchRisk}, laneWeight=${laneWeight})` },
+              { status: "cannot_fix", reason: `Final priority score too low to auto-merge: score=${finalScore} (rps=${rpsScore}, judgePenalty=${judgePenalty}, patchRisk=${patchRisk}, laneWeight=${laneWeight}, mismatchPenalty=${mismatchPenalty})` },
               env.GITHUB_PAT,
             );
             action = "issue_escalated";
           }
 
-          scorePayload = { rps_score: rpsScore, judge_penalty: judgePenalty, patch_risk: patchRisk, lane_weight: laneWeight, final_priority_score: finalScore };
+          scorePayload = { rps_score: rpsScore, judge_penalty: judgePenalty, patch_risk: patchRisk, lane_weight: laneWeight, mismatch_penalty: mismatchPenalty, final_priority_score: finalScore };
 
           // Update in-memory metrics (scoring path — has rpsScore + finalScore)
           metrics_total_requests++;
+          if (cwe_mismatch) metrics_mismatch_count++;
           if (action === "pr_opened") metrics_pr_opened_count++;
           else metrics_issue_escalated_count++;
           metrics_total_final_score += finalScore;
@@ -1234,6 +1333,7 @@ export default {
       // Update metrics for cannot_fix / patch-guard-blocked paths (no score computed)
       if (Object.keys(scorePayload).length === 0 && action !== undefined) {
         metrics_total_requests++;
+        if (cwe_mismatch) metrics_mismatch_count++;
         if (action === "pr_opened") metrics_pr_opened_count++;
         else metrics_issue_escalated_count++;
         recent_decisions.push({ timestamp: new Date().toISOString(), repo, cve_id: cve_id ?? null, final_score: 0, decision: action });
@@ -1242,11 +1342,38 @@ export default {
 
       console.log("Pipeline duration:", Date.now() - start, "ms");
 
+      const decisionPath = [
+        "classify",
+        "rag",
+        "remediate",
+        "patch_guard",
+        ...(judgeWasRun ? ["judge"] : []),
+        "rps",
+        "score",
+        action,
+      ].join(" → ");
+
       return new Response(
         JSON.stringify({
           action,
           github_url: githubUrl,
-          classification,
+          classification: {
+            cwe_id: classification.cwe_id,
+            confidence: classification.confidence,
+          },
+          correlation: {
+            cve_id: cve_id ?? null,
+            cwe_mismatch,
+          },
+          metrics: {
+            mismatch_penalty:      scorePayload.mismatch_penalty    ?? 0,
+            judge_penalty:         scorePayload.judge_penalty        ?? 0,
+            final_priority_score:  scorePayload.final_priority_score ?? 0,
+          },
+          explainability: {
+            factors:       explainabilityFactors,
+            decision_path: decisionPath,
+          },
           remediation_status: remediation.status,
           ...scorePayload,
         }),
