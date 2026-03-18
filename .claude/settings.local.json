@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(npm create:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(grep:*)"
     ]
   }
 }

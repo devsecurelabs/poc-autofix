@@ -26,6 +26,101 @@ jobs:
         with:
           files: vulnerable_code/**
 
+      - name: Set up Python for detection layer
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run static analysis
+        id: scan
+        continue-on-error: true
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+        run: |
+          set -uo pipefail
+
+          # Install static analysis engine (fail-safe: continue if unavailable)
+          pip install opengrep --quiet 2>/dev/null || true
+
+          # Scope to vulnerable_code/** only
+          TARGET_FILES=""
+          for f in $CHANGED_FILES; do
+            [[ "$f" == vulnerable_code/* ]] && TARGET_FILES="$TARGET_FILES $f"
+          done
+          TARGET_FILES="$(echo "$TARGET_FILES" | xargs)"
+
+          if [ -z "$TARGET_FILES" ]; then
+            echo "[ANALYSIS] No in-scope files — scan skipped."
+            echo '{"results":[],"errors":[]}' > scan_results.json
+            exit 0
+          fi
+
+          echo "[ANALYSIS] Scanning $(echo "$TARGET_FILES" | wc -w) file(s)."
+
+          # Run analysis; capture results even on non-zero exit (findings = exit 1)
+          opengrep scan --json --output scan_results.json $TARGET_FILES 2>/dev/null || true
+
+          if [ ! -f scan_results.json ]; then
+            echo "[ANALYSIS] No output produced — writing empty result."
+            echo '{"results":[],"errors":[]}' > scan_results.json
+          fi
+
+          echo "[ANALYSIS] Scan complete."
+
+      - name: Normalise detection output
+        id: detection
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys
+
+          SEVERITY_RANK = {"ERROR": 3, "WARNING": 2, "INFO": 1}
+          EMPTY = {"available": False}
+
+          try:
+              with open("scan_results.json") as f:
+                  raw = json.load(f)
+          except Exception as e:
+              print(f"[DETECTION] Could not read scan output ({e}) — skipping.")
+              json.dump(EMPTY, open("ds_detection.json", "w"))
+              sys.exit(0)
+
+          results = raw.get("results", [])
+          if not results:
+              print("[DETECTION] No findings — signal not injected.")
+              json.dump(EMPTY, open("ds_detection.json", "w"))
+              sys.exit(0)
+
+          # Select highest-severity finding; stable (first match wins on tie)
+          best = max(results, key=lambda r: SEVERITY_RANK.get(
+              r.get("extra", {}).get("severity", "INFO").upper(), 0))
+
+          metadata = best.get("extra", {}).get("metadata", {})
+
+          # Normalise CWE — e.g. ["CWE-89: SQL Injection"] → "CWE-89"
+          raw_cwe = metadata.get("cwe") or metadata.get("cwe-id")
+          cwe_hint = None
+          if raw_cwe:
+              if isinstance(raw_cwe, list):
+                  raw_cwe = raw_cwe[0]
+              token = str(raw_cwe).split(":")[0].strip()
+              if token.upper().startswith("CWE-"):
+                  cwe_hint = token
+
+          # CVE — optional; never inferred
+          cve_raw = metadata.get("cve") or metadata.get("cve-id")
+          cve_id = str(cve_raw) if cve_raw and str(cve_raw).upper().startswith("CVE-") else None
+
+          rule_id = best.get("check_id", "unknown")
+
+          ds = {"type": "static_code", "rule_id": rule_id}
+          if cwe_hint: ds["cwe_hint"] = cwe_hint
+          if cve_id:   ds["cve_id"]   = cve_id
+
+          json.dump({"available": True, "ds_detection": ds}, open("ds_detection.json", "w"))
+          print(f"[DETECTION] Signal normalised — rule={rule_id} cwe={cwe_hint} cve={cve_id}")
+          PYEOF
+
       - name: Send to Cloudflare Worker and Save Fix
         env:
           CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
@@ -43,9 +138,19 @@ jobs:
           # Normalize Worker endpoint (handles trailing slash safely)
           ENDPOINT="${CF_WORKER_URL%/}/remediate"
 
-          # 🔍 Debug: confirm endpoint and token are resolved before any curl call
+          # Debug: confirm endpoint and token are resolved before any curl call
           echo "Calling endpoint: ${CF_WORKER_URL%/}/remediate"
           echo "Token length: ${#WORKER_SECRET}"
+
+          # Read detection signal produced by normalisation step (optional)
+          DS_AVAILABLE=$(jq -r '.available // false' ds_detection.json 2>/dev/null || echo "false")
+          if [ "$DS_AVAILABLE" = "true" ]; then
+            DS_PAYLOAD=$(jq '.ds_detection' ds_detection.json)
+            echo "[DETECTION] Signal present — injecting into request."
+          else
+            DS_PAYLOAD="null"
+            echo "[DETECTION] No signal — proceeding without detection context."
+          fi
 
           for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
             echo "Processing $file..."
@@ -55,13 +160,23 @@ jobs:
             name="${filename%.*}"
             output_path="remediated_code/${name}_fixed.${extension}"
 
-            # Safely package the payload
-            JSON_PAYLOAD=$(jq -n \
-              --arg repo "${{ github.repository }}" \
-              --arg path "$file" \
-              --rawfile code "$file" \
-              --arg lang "$extension" \
-              '{repo: $repo, file_path: $path, code: $code, language: $lang}')
+            # Build payload — include ds_detection only when available
+            if [ "$DS_AVAILABLE" = "true" ]; then
+              JSON_PAYLOAD=$(jq -n \
+                --arg repo "${{ github.repository }}" \
+                --arg path "$file" \
+                --rawfile code "$file" \
+                --arg lang "$extension" \
+                --argjson ds_detection "$DS_PAYLOAD" \
+                '{repo: $repo, file_path: $path, code: $code, language: $lang, ds_detection: $ds_detection}')
+            else
+              JSON_PAYLOAD=$(jq -n \
+                --arg repo "${{ github.repository }}" \
+                --arg path "$file" \
+                --rawfile code "$file" \
+                --arg lang "$extension" \
+                '{repo: $repo, file_path: $path, code: $code, language: $lang}')
+            fi
 
             echo "Sending $filename to Orchestrator..."
 
