@@ -122,7 +122,7 @@ async function classify(
   env: Env,
 ): Promise<ClassificationResult> {
   const system = `You are a senior application security engineer specialising in static analysis.
-Analyse the provided source code and return ONLY a valid JSON object — no prose, no markdown fences, no explanation.
+Analyse the provided source code and return ONLY raw JSON. No markdown formatting, no backticks, no explanations.
 
 Required schema:
 {
@@ -137,7 +137,9 @@ Lane assignment guide:
   1 — Trivial: rename, constant swap, single-line sanitiser call
   2 — Localised: logic change within one function, parameterised query, encoding fix
   3 — Moderate: multi-function refactor, interface change, new dependency required
-  4 — Architectural or cannot assess: systemic design flaw, insufficient context`;
+  4 — Architectural or cannot assess: systemic design flaw, insufficient context
+
+Output the JSON object and nothing else. Do not wrap it in a code block.`;
 
   const user = `Language: ${language}\n\nVulnerable code:\n\`\`\`${language}\n${code}\n\`\`\``;
 
@@ -149,11 +151,27 @@ Lane assignment guide:
     512,
   );
 
-  const match = raw.match(/\{[\s\S]*\}/);
-  if (!match) {
-    throw new Error(`Qwen2.5 classification did not return JSON. Raw output: ${raw}`);
+  // Sanitise: slice from first '{' to last '}' to strip any surrounding markdown or prose
+  const first = raw.indexOf("{");
+  const last  = raw.lastIndexOf("}");
+  if (first === -1 || last === -1 || last <= first) {
+    console.error(JSON.stringify({ event: "classify_no_json", raw_output: raw.slice(0, 500) }));
+    throw new Error(`L2 Classifier returned no JSON object. Raw: ${raw.slice(0, 300)}`);
   }
-  return JSON.parse(match[0]) as ClassificationResult;
+  const jsonSlice = raw.slice(first, last + 1);
+
+  try {
+    return JSON.parse(jsonSlice) as ClassificationResult;
+  } catch (parseErr) {
+    console.error(JSON.stringify({
+      event:       "classify_json_parse_failed",
+      error:       parseErr instanceof Error ? parseErr.message : String(parseErr),
+      raw_output:  raw.slice(0, 500),
+      json_slice:  jsonSlice.slice(0, 500),
+    }));
+    // Graceful fallback — pipeline will escalate via low confidence + lane 4
+    return { error: "invalid_json", confidence: 0, status: "failed" } as unknown as ClassificationResult;
+  }
 }
 
 // ---------------------------------------------------------------------------
