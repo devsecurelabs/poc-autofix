@@ -19,4 +19,4 @@ def get_user_by_id(user_id):
 
 if __name__ == "__main__":
     # Test call
-    print(get_user_by_id("1")) 
+    print(get_user_by_id("1"))
