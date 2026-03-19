@@ -1,22 +1,22 @@
 import sqlite3
 
-def get_user_data(username):
-    # Connect to a dummy SQLite database
+def get_user_by_id(user_id):
+    # Connect to a dummy database
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
-
-    # VULNERABILITY: String concatenation allows SQL Injection!
-    # An attacker could pass a username like: admin' OR '1'='1
-    query = "SELECT id, username, email FROM users WHERE username = '" + username + "'"
-
+    
+    # VULNERABILITY: Raw string formatting allows SQL Injection
+    # An attacker could provide "1; DROP TABLE users;"
+    query = "SELECT username, email FROM users WHERE id = %s" % user_id
+    
     try:
         cursor.execute(query)
-        result = cursor.fetchall()
-        return result
+        return cursor.fetchone()
     except Exception as e:
-        return str(e)
+        return f"Error: {str(e)}"
     finally:
         conn.close()
 
-# Example of how an attacker might exploit this:
-# print(get_user_data("admin' OR '1'='1"))
+if __name__ == "__main__":
+    # Test call
+    print(get_user_by_id("1"))
