@@ -21,25 +21,60 @@ jobs:
           FILE="${{ github.event.inputs.file_path }}"
           EXT="${FILE##*.}"
           case "$EXT" in
-            py)   LANG="python" ;;
+            py)   LANG="python"     ;;
             js)   LANG="javascript" ;;
-            java) LANG="java" ;;
-            php)  LANG="php" ;;
-            *)    LANG="unknown" ;;
+            ts)   LANG="typescript" ;;
+            java) LANG="java"       ;;
+            php)  LANG="php"        ;;
+            rb)   LANG="ruby"       ;;
+            cs)   LANG="csharp"     ;;
+            dart) LANG="dart"       ;;
+            *)    LANG="unknown"    ;;
           esac
           echo "lang=$LANG" >> $GITHUB_OUTPUT
           echo "Detected language: $LANG (extension: .$EXT)"
 
+      - name: Install Semgrep (silent oracle)
+        run: pip install semgrep --quiet
+
+      - name: Run Semgrep broad-spectrum scan
+        id: semgrep
+        continue-on-error: true
+        run: |
+          semgrep scan \
+            --config "p/php" \
+            --config "p/ruby" \
+            --config "p/csharp" \
+            --config "p/javascript" \
+            --config "p/typescript" \
+            --config "p/python" \
+            --config "p/java" \
+            --config "p/security-audit" \
+            --json \
+            --output results.json \
+            "${{ github.event.inputs.file_path }}" || true
+          echo "Semgrep scan complete."
+
       - name: Build JSON payload
         id: build_json
         run: |
-          # We use --rawfile to safely ingest the code without shell expansion issues
+          # Extract CVE from Semgrep results if present (silent oracle — discarded by orchestrator normalisation layer)
+          CVE_ID=$(jq -r '.results[0].extra.metadata.cve // empty' results.json 2>/dev/null || echo "")
+
+          # Build payload — --rawfile avoids all shell-expansion hazards with $ in PHP/Ruby/Dart code
           jq -n \
             --arg repo "${{ github.repository }}" \
             --arg path "${{ github.event.inputs.file_path }}" \
             --rawfile code "${{ github.event.inputs.file_path }}" \
             --arg lang "${{ steps.detect_lang.outputs.lang }}" \
-            '{repo: $repo, file_path: $path, code: $code, language: $lang}' > payload.json
+            --arg cve_id "$CVE_ID" \
+            '{
+              repo: $repo,
+              file_path: $path,
+              code: $code,
+              language: $lang,
+              cve_id: (if $cve_id == "" then null else $cve_id end)
+            }' > payload.json
 
           echo "Payload generated successfully."
 
@@ -54,7 +89,7 @@ jobs:
             --header "Content-Type: application/json" \
             --header "Authorization: Bearer $WORKER_SECRET" \
             --data @payload.json)
-          
+
           echo "HTTP status: $HTTP_STATUS"
           if [ "$HTTP_STATUS" -ne 200 ]; then
             cat response.json
@@ -63,19 +98,21 @@ jobs:
 
       - name: Job Summary
         run: |
-          # 1. Parse the new risk fields from the response.json
           ACTION=$(jq -r '.action // "unknown"' response.json)
           GITHUB_URL=$(jq -r '.github_url // "N/A"' response.json)
           CWE=$(jq -r '.classification.cwe_id // "N/A"' response.json)
+          LANG="${{ steps.detect_lang.outputs.lang }}"
           RPS=$(jq -r '.risk.rps_score // "N/A"' response.json)
           PRIORITY=$(jq -r '.risk.final_priority_score // "N/A"' response.json)
-          
-          # 2. Write the markdown table to the GitHub Step Summary
-          echo "## 🛡️ DevSecure Remediation Result" >> $GITHUB_STEP_SUMMARY
+          RPS_SOURCE=$(jq -r '.risk.source // "N/A"' response.json)
+
+          echo "## DevSecure Remediation Result" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| **Action** | \`$ACTION\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Language** | $LANG |" >> $GITHUB_STEP_SUMMARY
           echo "| **CWE** | $CWE |" >> $GITHUB_STEP_SUMMARY
           echo "| **Exploit Activity (RPS)** | **$RPS / 100** |" >> $GITHUB_STEP_SUMMARY
           echo "| **Final Priority Score** | $PRIORITY / 100 |" >> $GITHUB_STEP_SUMMARY
+          echo "| **RPS Source** | $RPS_SOURCE |" >> $GITHUB_STEP_SUMMARY
           echo "| **GitHub Link** | [View Here]($GITHUB_URL) |" >> $GITHUB_STEP_SUMMARY
