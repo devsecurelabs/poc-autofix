@@ -15,6 +15,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Detect language from file extension
+        id: detect_lang
+        run: |
+          FILE="${{ github.event.inputs.file_path }}"
+          EXT="${FILE##*.}"
+          case "$EXT" in
+            py)   LANG="python" ;;
+            js)   LANG="javascript" ;;
+            java) LANG="java" ;;
+            php)  LANG="php" ;;
+            *)    LANG="unknown" ;;
+          esac
+          echo "lang=$LANG" >> $GITHUB_OUTPUT
+          echo "Detected language: $LANG (extension: .$EXT)"
+
       - name: Build JSON payload
         id: build_json
         run: |
@@ -23,9 +38,9 @@ jobs:
             --arg repo "${{ github.repository }}" \
             --arg path "${{ github.event.inputs.file_path }}" \
             --rawfile code "${{ github.event.inputs.file_path }}" \
-            --arg lang "python" \
+            --arg lang "${{ steps.detect_lang.outputs.lang }}" \
             '{repo: $repo, file_path: $path, code: $code, language: $lang}' > payload.json
-          
+
           echo "Payload generated successfully."
 
       - name: POST to DevSecure Worker
