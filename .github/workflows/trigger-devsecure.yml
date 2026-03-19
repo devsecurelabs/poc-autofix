@@ -48,13 +48,19 @@ jobs:
 
       - name: Job Summary
         run: |
+          # 1. Parse the new risk fields from the response.json
           ACTION=$(jq -r '.action // "unknown"' response.json)
           GITHUB_URL=$(jq -r '.github_url // "N/A"' response.json)
           CWE=$(jq -r '.classification.cwe_id // "N/A"' response.json)
+          RPS=$(jq -r '.risk.rps_score // "N/A"' response.json)
+          PRIORITY=$(jq -r '.risk.final_priority_score // "N/A"' response.json)
           
-          echo "## DevSecure Result" >> $GITHUB_STEP_SUMMARY
+          # 2. Write the markdown table to the GitHub Step Summary
+          echo "## 🛡️ DevSecure Remediation Result" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| **Action** | \`$ACTION\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **CWE** | $CWE |" >> $GITHUB_STEP_SUMMARY
-          echo "| **GitHub URL** | $GITHUB_URL |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Exploit Activity (RPS)** | **$RPS / 100** |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Final Priority Score** | $PRIORITY / 100 |" >> $GITHUB_STEP_SUMMARY
+          echo "| **GitHub Link** | [View Here]($GITHUB_URL) |" >> $GITHUB_STEP_SUMMARY

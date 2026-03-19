@@ -261,14 +261,60 @@ ${code}
     console.error("RAW LLM OUTPUT:", raw);
     throw new Error(`Remediation model did not return JSON. Raw output: ${raw}`);
   }
+
+  // ── Primary path: strict JSON.parse ──────────────────────────────────────
   let result: RemediationResult;
   try {
     result = JSON.parse(match[0]) as RemediationResult;
+    return result;
   } catch (e) {
-    console.error("RAW LLM OUTPUT:", raw);
-    throw new Error(`Remediation JSON parse failed: ${e instanceof Error ? e.message : String(e)}`);
+    const parseErr = e instanceof Error ? e.message : String(e);
+    console.error(`Remediation JSON parse failed (${parseErr}) — attempting raw-text fallback`);
   }
-  return result;
+
+  // ── Fallback: raw-text regex extraction ──────────────────────────────────
+  // The 32B model sometimes emits unescaped newlines inside the JSON string
+  // literal for search_replace_block, producing "Bad control character" errors.
+  // Rather than failing, we extract the status and the block directly from the
+  // raw LLM output, making the patch text the source of truth instead of the
+  // JSON envelope.
+
+  const statusMatch = raw.match(/"status"\s*:\s*"(fixed|cannot_fix)"/);
+  if (!statusMatch) {
+    console.error("RAW LLM OUTPUT:", raw);
+    throw new Error("Remediation JSON parse failed and raw-text fallback could not extract status");
+  }
+  const status = statusMatch[1] as "fixed" | "cannot_fix";
+
+  if (status === "cannot_fix") {
+    // Extract reason if present; safe to return without a block
+    const reasonMatch = raw.match(/"reason"\s*:\s*"([^"]+)"/);
+    console.log("Raw-text fallback: cannot_fix extracted");
+    return { status: "cannot_fix", reason: reasonMatch?.[1] ?? "Model returned cannot_fix (raw-text fallback)" };
+  }
+
+  // status === "fixed" — extract the search/replace block directly from raw text.
+  // No JSON.parse: the 32B model mixes unescaped and escaped quotes, making any
+  // JSON token reconstruction unreliable. The raw block is the source of truth.
+  const blockMatch = raw.match(/(<<<< SEARCH[\s\S]*?>>>> REPLACE)/);
+  if (!blockMatch) {
+    console.error("RAW LLM OUTPUT:", raw);
+    throw new Error("Remediation JSON parse failed and raw-text fallback could not extract search/replace block");
+  }
+
+  // Undo JSON escape sequences the model emitted inside the string value.
+  // No JSON.parse — the mixed-quote environment makes token reconstruction unsafe.
+  // Order is critical: double-backslashes must be resolved first so that \\n is
+  // not mistakenly converted to a real newline before \\\\ is collapsed.
+  const decodedBlock = blockMatch[1]
+    .replace(/\\\\/g, "\\")   // \\\\ → \   (collapse double-backslashes first)
+    .replace(/\\"/g, '"')      // \\"  → "   (unescape escaped quotes)
+    .replace(/\\n/g, "\n")     // \n   → LF  (literal backslash-n → real newline)
+    .replace(/\\r/g, "\r")     // \r   → CR
+    .replace(/\\t/g, "\t");    // \t   → TAB
+
+  console.log(JSON.stringify({ event: "remediation_fallback_used", block_length: decodedBlock.length }));
+  return { status: "fixed", search_replace_block: decodedBlock };
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +415,9 @@ function safeAtob(input: string): string {
 // patched line array so relative positions remain stable.
 function applySearchReplace(original: string, llmOutput: string): string {
   // Regex: tolerates optional \r before each \n (CRLF-safe)
-  const BLOCK_RE = /<<<< SEARCH\r?\n([\s\S]*?)\r?\n====\r?\n([\s\S]*?)\r?\n>>>> REPLACE/g;
+  // \s* absorbs trailing spaces on the tag lines.
+  // =+ accepts any run of equals signs (e.g. git-conflict-style "=======" or "====").
+  const BLOCK_RE = /<<<< SEARCH\s*\r?\n([\s\S]*?)\r?\n=+\s*\r?\n([\s\S]*?)\r?\n>>>> REPLACE/g;
 
   const blocks: Array<{ search: string; replace: string }> = [];
   let m: RegExpExecArray | null;
@@ -586,8 +634,13 @@ function checkPatchGuard(original: string, fixed: string): PatchGuardResult {
   const changePercent = originalCount > 0 ? (changedLines / originalCount) * 100 : 100;
   const sizeRatio = originalBytes > 0 ? fixedBytes / originalBytes : Infinity;
 
+  // Absolute Floor: small targeted fixes (≤ 10 changed lines) are always allowed
+  // regardless of changePercent. The 20% limit is only meaningful on larger files;
+  // on a 20-line file a 5-line security fix legitimately exceeds 20% without risk.
+  const absoluteFloor = changedLines <= 10;
+
   const violations: string[] = [];
-  if (changePercent > 20) {
+  if (!absoluteFloor && changePercent > 20) {
     violations.push(`${changePercent.toFixed(1)}% of lines changed (limit: 20%)`);
   }
   if (changedLines > 50) {
@@ -601,9 +654,16 @@ function checkPatchGuard(original: string, fixed: string): PatchGuardResult {
   }
 
   const allowed = violations.length === 0;
-  console.log(
-    `Patch Guard: originalLines=${originalCount} fixedLines=${fixedCount} changedLines=${changedLines} changePercent=${changePercent.toFixed(1)}% sizeRatio=${sizeRatio.toFixed(2)} allowed=${allowed}`,
-  );
+  console.log(JSON.stringify({
+    event: "patch_guard",
+    originalLines: originalCount,
+    fixedLines: fixedCount,
+    changedLines,
+    changePercent: parseFloat(changePercent.toFixed(1)),
+    sizeRatio: parseFloat(sizeRatio.toFixed(2)),
+    absoluteFloor,
+    allowed,
+  }));
 
   return {
     allowed,
@@ -1484,6 +1544,7 @@ export default {
         lane_weight: number;
         mismatch_penalty: number;
         final_priority_score: number;
+        rps_source: "external" | "pseudo_rps";
       } | Record<string, never> = {};
 
       if (remediation.status === "cannot_fix") {
@@ -1723,7 +1784,7 @@ export default {
             action = "issue_escalated";
           }
 
-          scorePayload = { rps_score: rpsScore, judge_penalty: judgePenalty, patch_risk: patchRisk, lane_weight: laneWeight, mismatch_penalty: mismatchPenalty, final_priority_score: finalScore };
+          scorePayload = { rps_score: rpsScore, judge_penalty: judgePenalty, patch_risk: patchRisk, lane_weight: laneWeight, mismatch_penalty: mismatchPenalty, final_priority_score: finalScore, rps_source: rpsSource };
 
           // Update in-memory metrics (scoring path — has rpsScore + finalScore)
           metrics_total_requests++;
@@ -1782,6 +1843,11 @@ export default {
             decision_path: decisionPath,
           },
           remediation_status: remediation.status,
+          risk: {
+            rps_score:            scorePayload.rps_score            ?? 0,
+            final_priority_score: scorePayload.final_priority_score ?? 0,
+            source:               scorePayload.rps_source           ?? null,
+          },
           ...scorePayload,
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
