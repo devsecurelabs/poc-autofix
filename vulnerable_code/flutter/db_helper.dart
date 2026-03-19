@@ -8,6 +8,6 @@ class DbHelper {
   Database? db;
 
   Future<List<Map>> getUser(String id) async {
-    return await db!.rawQuery('SELECT * FROM users WHERE id = $id');
+    return await db!.rawQuery('SELECT * FROM users WHERE id = ?', [id]);
   }
 }
