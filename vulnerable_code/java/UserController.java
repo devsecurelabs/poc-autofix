@@ -16,11 +16,9 @@ public class UserController {
 
     @GetMapping("/user")
     public List<Map<String, Object>> getUser(@RequestParam String username) {
-        // VULNERABLE: Raw string concatenation in SQL query
-        // CWE-89: Improper Neutralization of Special Elements used in an SQL Command
-        // An attacker can supply username=admin' OR '1'='1'-- to bypass authentication
-        String sql = "SELECT id, username, email FROM users WHERE username = '" + username + "'";
+        // SECURE: Using parameterized query to prevent SQL injection
+        String sql = "SELECT id, username, email FROM users WHERE username = ?";
 
-        return jdbcTemplate.queryForList(sql);
+        return jdbcTemplate.queryForList(sql, username);
     }
 }
