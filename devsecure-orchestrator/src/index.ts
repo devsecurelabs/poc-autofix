@@ -169,8 +169,15 @@ Output the JSON object and nothing else. Do not wrap it in a code block.`;
       raw_output:  raw.slice(0, 500),
       json_slice:  jsonSlice.slice(0, 500),
     }));
-    // Graceful fallback — pipeline will escalate via low confidence + lane 4
-    return { error: "invalid_json", confidence: 0, status: "failed" } as unknown as ClassificationResult;
+    // Graceful fallback — complete object so downstream code never starves on missing fields.
+    // Zero confidence + lane 4 ensures the confidence gate blocks and escalates to L4.
+    return {
+      cwe_id:     "UNKNOWN",
+      cwe_name:   "Classification Error",
+      confidence: 0,
+      lane:       4,
+      summary:    "L2 classification failed — JSON parse error from LLM response. Manual review required.",
+    } as ClassificationResult;
   }
 }
 
@@ -1570,14 +1577,32 @@ export default {
 
       // ── Step 3: Confidence gate (fail-closed) ─────────────────────────────
       pipelineStep = "confidence_gate";
+
+      // Early exit: L2 fallback or structurally incomplete classification
+      const classificationInvalid =
+        !classification.cwe_id ||
+        !classification.summary ||
+        typeof classification.confidence !== "number" ||
+        typeof classification.lane !== "number";
+
+      if (classificationInvalid) {
+        console.log(JSON.stringify({ event: "confidence_gate_skipped", reason: "invalid_classification_data", classification }));
+        console.log("Pipeline duration:", Date.now() - start, "ms");
+        return new Response(
+          JSON.stringify({ status: "skipped", reason: "invalid_classification_data", classification }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
       const BENIGN_PATTERNS = ["no vulnerability", "benign", "not vulnerable"];
-      const summaryLower = classification.summary.toLowerCase();
+      const summaryLower = (classification.summary ?? "").toLowerCase();
       const cweBlocked =
         !classification.cwe_id ||
-        classification.cwe_id.trim() === "" ||
-        classification.cwe_id === "CWE-0";
-      const confidenceBlocked = classification.confidence < 0.75;
-      const laneBlocked = classification.lane >= 3;
+        (classification.cwe_id?.trim() ?? "") === "" ||
+        classification.cwe_id === "CWE-0" ||
+        classification.cwe_id === "UNKNOWN";
+      const confidenceBlocked = (classification.confidence ?? 0) < 0.75;
+      const laneBlocked = (classification.lane ?? 4) >= 3;
       const summaryBlocked = BENIGN_PATTERNS.some((p) => summaryLower.includes(p));
       if (confidenceBlocked || laneBlocked || cweBlocked || summaryBlocked) {
         console.log("Blocked by confidence gate:", JSON.stringify(classification));
