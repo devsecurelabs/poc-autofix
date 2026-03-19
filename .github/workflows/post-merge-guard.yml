@@ -1,0 +1,249 @@
+name: Post-Merge Guard
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  post-merge-guard:
+    name: Post-Merge Guard — Regression Detection & Rollback
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Skip if this is a rollback commit
+        id: rollback-check
+        run: |
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+          echo "Commit message: $COMMIT_MSG"
+          if echo "$COMMIT_MSG" | grep -qi "rollback"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "[POST_MERGE_GUARD] Rollback commit detected — skipping guard."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout main branch
+        if: steps.rollback-check.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 2
+
+      - name: Detect files to validate
+        if: steps.rollback-check.outputs.skip == 'false'
+        id: changed
+        run: |
+          echo "[POST_MERGE_GUARD] Starting post-merge validation for commit ${{ github.sha }}"
+          CHANGED=$(git diff --name-only HEAD~1 HEAD)
+          echo "Changed files in this merge:"
+          echo "$CHANGED"
+
+          SCOPED=$(echo "$CHANGED" | grep -E '^(vulnerable_code|remediated_code)/' || true)
+          if [ -z "$SCOPED" ]; then
+            echo "No files in vulnerable_code/ or remediated_code/ changed — validating all changed files instead."
+            SCOPED="$CHANGED"
+          fi
+          echo "Scoped files for validation:"
+          echo "$SCOPED"
+
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$SCOPED" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python (if .py files present)
+        if: >
+          steps.rollback-check.outputs.skip == 'false' &&
+          contains(steps.changed.outputs.files, '.py')
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node (if .js/.ts files present)
+        if: >
+          steps.rollback-check.outputs.skip == 'false' &&
+          (contains(steps.changed.outputs.files, '.js') ||
+           contains(steps.changed.outputs.files, '.ts'))
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate changed files
+        if: steps.rollback-check.outputs.skip == 'false'
+        id: validate
+        env:
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          set -euo pipefail
+          FAILED=0
+          FAIL_REASON=""
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "[POST_MERGE_GUARD] No files to validate — passing."
+            exit 0
+          fi
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            [ ! -f "$file" ] && echo "[POST_MERGE_GUARD] SKIP (deleted): $file" && continue
+
+            ext="${file##*.}"
+            echo ""
+            echo "--- Validating: $file (language: $ext) ---"
+
+            case "$ext" in
+
+              py)
+                echo "[POST_MERGE_GUARD] Running: python -m py_compile $file"
+                if python -m py_compile "$file" 2>&1; then
+                  echo "[POST_MERGE_GUARD] PASS: $file"
+                else
+                  echo "[POST_MERGE_GUARD] FAILED: syntax error in $file"
+                  FAILED=1
+                  FAIL_REASON="Python syntax error in $file"
+                fi
+                ;;
+
+              js|ts)
+                if [ -f "package.json" ]; then
+                  echo "package.json detected — installing dependencies"
+                  if [ -f "package-lock.json" ]; then
+                    npm ci --prefer-offline 2>/dev/null || npm install --prefer-offline
+                  else
+                    npm install --prefer-offline
+                  fi
+
+                  if node -e "const p=require('./package.json'); process.exit(p.scripts&&p.scripts.build?0:1)" 2>/dev/null; then
+                    echo "[POST_MERGE_GUARD] Running: npm run build"
+                    if npm run build 2>&1; then
+                      echo "[POST_MERGE_GUARD] PASS (build): $file"
+                    else
+                      echo "[POST_MERGE_GUARD] FAILED: build failed for $file"
+                      FAILED=1
+                      FAIL_REASON="Node build failure for $file"
+                    fi
+                  else
+                    echo "No build script — running: node --check $file"
+                    if node --check "$file" 2>&1; then
+                      echo "[POST_MERGE_GUARD] PASS (node --check): $file"
+                    else
+                      echo "[POST_MERGE_GUARD] FAILED: syntax error in $file"
+                      FAILED=1
+                      FAIL_REASON="JS/TS syntax error in $file"
+                    fi
+                  fi
+                else
+                  echo "No package.json — running: node --check $file"
+                  if node --check "$file" 2>&1; then
+                    echo "[POST_MERGE_GUARD] PASS (node --check): $file"
+                  else
+                    echo "[POST_MERGE_GUARD] FAILED: syntax error in $file"
+                    FAILED=1
+                    FAIL_REASON="JS/TS syntax error in $file"
+                  fi
+                fi
+                ;;
+
+              php)
+                if ! command -v php &>/dev/null; then
+                  echo "php not available — installing"
+                  sudo apt-get install -y php-cli -q
+                fi
+                echo "[POST_MERGE_GUARD] Running: php -l $file"
+                if php -l "$file" 2>&1; then
+                  echo "[POST_MERGE_GUARD] PASS: $file"
+                else
+                  echo "[POST_MERGE_GUARD] FAILED: syntax error in $file"
+                  FAILED=1
+                  FAIL_REASON="PHP syntax error in $file"
+                fi
+                ;;
+
+              *)
+                echo "[POST_MERGE_GUARD] No validator available for extension: $ext — skipping $file"
+                ;;
+            esac
+
+          done <<< "$CHANGED_FILES"
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "fail_reason=$FAIL_REASON" >> "$GITHUB_OUTPUT"
+            echo ""
+            echo "[POST_MERGE_GUARD] FAILED — validation errors detected."
+            exit 1
+          fi
+
+          echo ""
+          echo "[POST_MERGE_GUARD] All file validations passed."
+
+      - name: Run test suite (if available)
+        if: steps.rollback-check.outputs.skip == 'false'
+        id: tests
+        run: |
+          set -euo pipefail
+
+          if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+            if python -m pytest --version &>/dev/null 2>&1; then
+              echo "[POST_MERGE_GUARD] Running pytest"
+              if python -m pytest --tb=short -q 2>&1; then
+                echo "[POST_MERGE_GUARD] pytest PASSED"
+              else
+                echo "fail_reason=pytest test failure" >> "$GITHUB_OUTPUT"
+                echo "[POST_MERGE_GUARD] FAILED — pytest reported failures."
+                exit 1
+              fi
+            fi
+          fi
+
+          if [ -f "package.json" ]; then
+            if node -e "const p=require('./package.json'); process.exit(p.scripts&&p.scripts.test?0:1)" 2>/dev/null; then
+              echo "[POST_MERGE_GUARD] Running npm test"
+              if npm test 2>&1; then
+                echo "[POST_MERGE_GUARD] npm test PASSED"
+              else
+                echo "fail_reason=npm test failure" >> "$GITHUB_OUTPUT"
+                echo "[POST_MERGE_GUARD] FAILED — npm test reported failures."
+                exit 1
+              fi
+            fi
+          fi
+
+          echo "[POST_MERGE_GUARD] Test stage complete."
+
+      - name: Rollback on failure
+        if: >
+          steps.rollback-check.outputs.skip == 'false' &&
+          failure() &&
+          (steps.validate.conclusion == 'failure' || steps.tests.conclusion == 'failure')
+        env:
+          FAIL_REASON: ${{ steps.validate.outputs.fail_reason || steps.tests.outputs.fail_reason || 'unknown validation failure' }}
+        run: |
+          set -euo pipefail
+
+          FAILED_COMMIT="${{ github.sha }}"
+          PREV_COMMIT=$(git rev-parse HEAD~1)
+
+          echo ""
+          echo "[POST_MERGE_GUARD] ROLLBACK TRIGGERED"
+          echo "  Failing commit : $FAILED_COMMIT"
+          echo "  Rolling back to: $PREV_COMMIT"
+          echo "  Reason         : $FAIL_REASON"
+          echo ""
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git reset --hard "$PREV_COMMIT"
+
+          if git push origin HEAD:main --force; then
+            echo "[POST_MERGE_GUARD] Rollback to $PREV_COMMIT succeeded."
+          else
+            echo "[POST_MERGE_GUARD] ERROR: Force push for rollback failed. Manual intervention required."
+            echo "  Failed commit  : $FAILED_COMMIT"
+            echo "  Target commit  : $PREV_COMMIT"
+            echo "  Reason         : $FAIL_REASON"
+            exit 1
+          fi

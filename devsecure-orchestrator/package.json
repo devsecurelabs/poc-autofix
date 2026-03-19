@@ -1,0 +1,15 @@
+{
+  "name": "devsecure-orchestrator",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250310.0",
+    "typescript": "^5.5.2",
+    "wrangler": "^3.109.0"
+  }
+}

@@ -1,0 +1,217 @@
+name: Learning Guard
+
+on:
+  schedule:
+    # Runs every 12 hours — picks up merges that are now 48+ hours old
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+
+jobs:
+  learning-guard:
+    name: Learning Guard — Verified Fix Ingestion
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Identify eligible fix commits
+        id: candidates
+        env:
+          NOW_TS: ${{ github.run_started_at }}
+        run: |
+          set -euo pipefail
+          echo "[LEARNING_GUARD] Starting learning guard scan"
+
+          FORTY_EIGHT_HOURS=172800
+          NOW=$(date +%s)
+          CUTOFF_OLD=$(( NOW - 604800 ))  # 7 days ago — don't look further back
+          CUTOFF_NEW=$(( NOW - FORTY_EIGHT_HOURS ))  # must be at least 48h old
+
+          # Collect all devsecure fix commits on main in the 7-day window
+          CANDIDATES=""
+          while IFS='|' read -r hash ts subject; do
+            ts=$(echo "$ts" | tr -d ' ')
+            [ -z "$hash" ] || [ -z "$ts" ] && continue
+
+            # Must be within 7-day window
+            [ "$ts" -lt "$CUTOFF_OLD" ] && continue
+            # Must be at least 48 hours old
+            [ "$ts" -gt "$CUTOFF_NEW" ] && continue
+
+            # Must be a devsecure security fix commit
+            if ! echo "$subject" | grep -q "fix(security): remediate"; then
+              continue
+            fi
+
+            # Skip if message contains rollback or revert
+            FULL_MSG=$(git log -1 --format="%B" "$hash")
+            if echo "$FULL_MSG" | grep -qiE "rollback|revert"; then
+              echo "[LEARNING_GUARD] rejected: $hash — commit message contains rollback/revert"
+              continue
+            fi
+
+            CANDIDATES="$CANDIDATES $hash"
+          done < <(git log main --format="%H|%ct|%s" --since="7 days ago")
+
+          echo "candidates=$CANDIDATES" >> "$GITHUB_OUTPUT"
+          echo "[LEARNING_GUARD] Candidate commits: $CANDIDATES"
+
+      - name: Process each candidate
+        if: steps.candidates.outputs.candidates != ''
+        env:
+          CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
+          WORKER_SECRET: ${{ secrets.DEVSECURE_WORKER_SECRET }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ENDPOINT="${CF_WORKER_URL%/}/ingest-fix"
+
+          for COMMIT_HASH in ${{ steps.candidates.outputs.candidates }}; do
+            echo ""
+            echo "=== Processing commit: $COMMIT_HASH ==="
+
+            # ── Guard: no rollback/revert commit exists AFTER this fix on main ──
+            LATER_COMMITS=$(git log "${COMMIT_HASH}..HEAD" --format="%s")
+            if echo "$LATER_COMMITS" | grep -qiE "rollback|revert"; then
+              echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — rollback/revert detected in subsequent commits"
+              continue
+            fi
+
+            # ── Parse commit message for metadata ─────────────────────────────
+            FULL_MSG=$(git log -1 --format="%B" "$COMMIT_HASH")
+            SUBJECT=$(git log -1 --format="%s" "$COMMIT_HASH")
+
+            # Extract CWE ID (e.g. CWE-89) from subject line
+            CWE_ID=$(echo "$SUBJECT" | grep -oE 'CWE-[0-9]+' | head -1 || true)
+            if [ -z "$CWE_ID" ]; then
+              echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — cannot parse CWE ID from commit message"
+              continue
+            fi
+
+            # Extract confidence (e.g. "Classification confidence: 87.5%")
+            CONFIDENCE_STR=$(echo "$FULL_MSG" | grep -oE 'Classification confidence: [0-9.]+%' | grep -oE '[0-9.]+' | head -1 || true)
+            if [ -z "$CONFIDENCE_STR" ]; then
+              echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — cannot parse confidence from commit message"
+              continue
+            fi
+            # Compare as integer (multiply by 10 to avoid bc dependency)
+            CONFIDENCE_INT=$(echo "$CONFIDENCE_STR" | cut -d'.' -f1)
+            if [ "$CONFIDENCE_INT" -lt 75 ]; then
+              echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — confidence ${CONFIDENCE_STR}% < 75%"
+              continue
+            fi
+
+            # Extract lane (e.g. "Routing lane: L2")
+            LANE=$(echo "$FULL_MSG" | grep -oE 'Routing lane: L[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+            if [ -z "$LANE" ]; then
+              echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — cannot parse routing lane from commit message"
+              continue
+            fi
+            if [ "$LANE" -gt 2 ]; then
+              echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — lane=$LANE > 2"
+              continue
+            fi
+
+            # ── Identify the changed file in this commit ───────────────────────
+            CHANGED_FILE=$(git diff-tree --no-commit-id -r --name-only "$COMMIT_HASH" \
+              | grep -E '^(remediated_code|vulnerable_code)/' | head -1 || true)
+            if [ -z "$CHANGED_FILE" ]; then
+              echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — no remediated_code or vulnerable_code file found"
+              continue
+            fi
+
+            # ── Retrieve original and fixed code via git show ──────────────────
+            FIXED_CODE=$(git show "${COMMIT_HASH}:${CHANGED_FILE}" 2>/dev/null || true)
+            ORIGINAL_CODE=$(git show "${COMMIT_HASH}~1:${CHANGED_FILE}" 2>/dev/null || true)
+
+            if [ -z "$FIXED_CODE" ]; then
+              echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — cannot retrieve fixed code from commit"
+              continue
+            fi
+
+            # ── Guard: original must differ from fixed ─────────────────────────
+            if [ "$ORIGINAL_CODE" = "$FIXED_CODE" ]; then
+              echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — original equals fixed (trivial/empty diff)"
+              continue
+            fi
+
+            # ── Guard: diff size < 20% ─────────────────────────────────────────
+            ORIG_LINES=$(echo "$ORIGINAL_CODE" | wc -l)
+            FIXED_LINES=$(echo "$FIXED_CODE" | wc -l)
+            if [ "$ORIG_LINES" -gt 0 ]; then
+              DIFF_LINES=$(diff <(echo "$ORIGINAL_CODE") <(echo "$FIXED_CODE") | grep -cE '^[<>]' || true)
+              # changed_pct = diff_lines * 100 / orig_lines (integer arithmetic)
+              CHANGED_PCT=$(( DIFF_LINES * 100 / ORIG_LINES ))
+              echo "  diff_lines=$DIFF_LINES orig_lines=$ORIG_LINES changed_pct=${CHANGED_PCT}%"
+              if [ "$CHANGED_PCT" -ge 20 ]; then
+                echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — diff ${CHANGED_PCT}% >= 20% threshold"
+                continue
+              fi
+            fi
+
+            # ── All checks passed — send to Worker /ingest-fix ─────────────────
+            TIMESTAMP=$(git log -1 --format="%cI" "$COMMIT_HASH")
+            SUMMARY="Verified fix for ${CWE_ID} in ${CHANGED_FILE} (confidence ${CONFIDENCE_STR}%, lane L${LANE})"
+
+            echo "  $CWE_ID | confidence=${CONFIDENCE_STR}% | lane=L${LANE} | file=${CHANGED_FILE}"
+            echo "[LEARNING_GUARD] All checks passed. Sending to /ingest-fix..."
+
+            JSON_PAYLOAD=$(jq -n \
+              --arg cwe_id "$CWE_ID" \
+              --arg summary "$SUMMARY" \
+              --arg fixed_code "$FIXED_CODE" \
+              --arg commit_sha "$COMMIT_HASH" \
+              --arg repo "$REPO" \
+              --arg timestamp "$TIMESTAMP" \
+              --arg confidence "$CONFIDENCE_STR" \
+              --arg lane "$LANE" \
+              --arg file_path "$CHANGED_FILE" \
+              '{
+                cwe_id: $cwe_id,
+                summary: $summary,
+                fixed_code: $fixed_code,
+                metadata: {
+                  commit_sha: $commit_sha,
+                  repo: $repo,
+                  timestamp: $timestamp,
+                  confidence: $confidence,
+                  lane: $lane,
+                  file_path: $file_path,
+                  source: "learning-guard"
+                }
+              }')
+
+            HTTP_STATUS=$(curl -s -w "%{http_code}" -o ingest_response.json \
+              -X POST \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $WORKER_SECRET" \
+              -d "$JSON_PAYLOAD" \
+              "$ENDPOINT")
+
+            echo "  HTTP status: $HTTP_STATUS"
+            cat ingest_response.json
+
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+              INGEST_STATUS=$(jq -r '.status // "unknown"' ingest_response.json)
+              if [ "$INGEST_STATUS" = "ingested" ]; then
+                echo "[LEARNING_GUARD] accepted: $COMMIT_HASH ingested as $(jq -r '.id' ingest_response.json)"
+              elif [ "$INGEST_STATUS" = "skipped" ]; then
+                echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — duplicate (score: $(jq -r '.score // "n/a"' ingest_response.json))"
+              else
+                echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — unexpected Worker response: $INGEST_STATUS"
+              fi
+            else
+              echo "[LEARNING_GUARD] rejected: $COMMIT_HASH — Worker returned HTTP $HTTP_STATUS"
+            fi
+
+          done
+
+          echo ""
+          echo "[LEARNING_GUARD] Scan complete."

@@ -1,0 +1,233 @@
+name: Automated Code Remediation Pipeline
+
+on:
+  push:
+    paths:
+      - 'vulnerable_code/**'
+  workflow_dispatch: # Allows manual triggering for testing
+
+jobs:
+  remediate:
+    name: Analyze and Fix Code
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v45
+        with:
+          files: vulnerable_code/**
+
+      - name: Set up Python for detection layer
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run static analysis
+        id: scan
+        continue-on-error: true
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+        run: |
+          set -uo pipefail
+
+          # Install static analysis engine (fail-safe: continue if unavailable)
+          pip install opengrep --quiet 2>/dev/null || true
+
+          # Scope to vulnerable_code/** only
+          TARGET_FILES=""
+          for f in $CHANGED_FILES; do
+            [[ "$f" == vulnerable_code/* ]] && TARGET_FILES="$TARGET_FILES $f"
+          done
+          TARGET_FILES="$(echo "$TARGET_FILES" | xargs)"
+
+          if [ -z "$TARGET_FILES" ]; then
+            echo "[ANALYSIS] No in-scope files — scan skipped."
+            echo '{"results":[],"errors":[]}' > scan_results.json
+            exit 0
+          fi
+
+          echo "[ANALYSIS] Scanning $(echo "$TARGET_FILES" | wc -w) file(s)."
+
+          # Run analysis; capture results even on non-zero exit (findings = exit 1)
+          opengrep scan --json --output scan_results.json $TARGET_FILES 2>/dev/null || true
+
+          if [ ! -f scan_results.json ]; then
+            echo "[ANALYSIS] No output produced — writing empty result."
+            echo '{"results":[],"errors":[]}' > scan_results.json
+          fi
+
+          echo "[ANALYSIS] Scan complete."
+
+      - name: Normalise detection output
+        id: detection
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys
+
+          SEVERITY_RANK = {"ERROR": 3, "WARNING": 2, "INFO": 1}
+          EMPTY = {"available": False}
+
+          try:
+              with open("scan_results.json") as f:
+                  raw = json.load(f)
+          except Exception as e:
+              print(f"[DETECTION] Could not read scan output ({e}) — skipping.")
+              json.dump(EMPTY, open("ds_detection.json", "w"))
+              sys.exit(0)
+
+          results = raw.get("results", [])
+          if not results:
+              print("[DETECTION] No findings — signal not injected.")
+              json.dump(EMPTY, open("ds_detection.json", "w"))
+              sys.exit(0)
+
+          # Select highest-severity finding; stable (first match wins on tie)
+          best = max(results, key=lambda r: SEVERITY_RANK.get(
+              r.get("extra", {}).get("severity", "INFO").upper(), 0))
+
+          metadata = best.get("extra", {}).get("metadata", {})
+
+          # Normalise CWE — e.g. ["CWE-89: SQL Injection"] → "CWE-89"
+          raw_cwe = metadata.get("cwe") or metadata.get("cwe-id")
+          cwe_hint = None
+          if raw_cwe:
+              if isinstance(raw_cwe, list):
+                  raw_cwe = raw_cwe[0]
+              token = str(raw_cwe).split(":")[0].strip()
+              if token.upper().startswith("CWE-"):
+                  cwe_hint = token
+
+          # CVE — optional; never inferred
+          cve_raw = metadata.get("cve") or metadata.get("cve-id")
+          cve_id = str(cve_raw) if cve_raw and str(cve_raw).upper().startswith("CVE-") else None
+
+          rule_id = best.get("check_id", "unknown")
+
+          ds = {"type": "static_code", "rule_id": rule_id}
+          if cwe_hint: ds["cwe_hint"] = cwe_hint
+          if cve_id:   ds["cve_id"]   = cve_id
+
+          json.dump({"available": True, "ds_detection": ds}, open("ds_detection.json", "w"))
+          print(f"[DETECTION] Signal normalised — rule={rule_id} cwe={cwe_hint} cve={cve_id}")
+          PYEOF
+
+      - name: Send to Cloudflare Worker and Save Fix
+        env:
+          CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
+          WORKER_SECRET: ${{ secrets.DEVSECURE_WORKER_SECRET }}
+        run: |
+          # Ensure output directory exists
+          mkdir -p remediated_code
+
+          # Fail fast if secret missing
+          if [ -z "$WORKER_SECRET" ]; then
+            echo "❌ WORKER_SECRET is missing"
+            exit 1
+          fi
+
+          # Normalize Worker endpoint (handles trailing slash safely)
+          ENDPOINT="${CF_WORKER_URL%/}/remediate"
+
+          # Debug: confirm endpoint and token are resolved before any curl call
+          echo "Calling endpoint: ${CF_WORKER_URL%/}/remediate"
+          echo "Token length: ${#WORKER_SECRET}"
+
+          # Read detection signal produced by normalisation step (optional)
+          DS_AVAILABLE=$(jq -r '.available // false' ds_detection.json 2>/dev/null || echo "false")
+          if [ "$DS_AVAILABLE" = "true" ]; then
+            DS_PAYLOAD=$(jq '.ds_detection' ds_detection.json)
+            echo "[DETECTION] Signal present — injecting into request."
+          else
+            DS_PAYLOAD="null"
+            echo "[DETECTION] No signal — proceeding without detection context."
+          fi
+
+          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+            echo "Processing $file..."
+
+            filename=$(basename -- "$file")
+            extension="${file##*.}"
+            name="${filename%.*}"
+            output_path="remediated_code/${name}_fixed.${extension}"
+
+            # Build payload — include ds_detection only when available
+            if [ "$DS_AVAILABLE" = "true" ]; then
+              JSON_PAYLOAD=$(jq -n \
+                --arg repo "${{ github.repository }}" \
+                --arg path "$file" \
+                --rawfile code "$file" \
+                --arg lang "$extension" \
+                --argjson ds_detection "$DS_PAYLOAD" \
+                '{repo: $repo, file_path: $path, code: $code, language: $lang, ds_detection: $ds_detection}')
+            else
+              JSON_PAYLOAD=$(jq -n \
+                --arg repo "${{ github.repository }}" \
+                --arg path "$file" \
+                --rawfile code "$file" \
+                --arg lang "$extension" \
+                '{repo: $repo, file_path: $path, code: $code, language: $lang}')
+            fi
+
+            echo "Sending $filename to Orchestrator..."
+
+            # POST to Worker with Authorization header
+            HTTP_STATUS=$(curl -s -w "%{http_code}" -o response.json \
+              -X POST \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $WORKER_SECRET" \
+              -H "X-Trace-Id: gha-${GITHUB_RUN_ID}-${RANDOM}" \
+              -d "$JSON_PAYLOAD" \
+              "$ENDPOINT")
+
+            echo "HTTP Status: $HTTP_STATUS"
+            echo "Worker response:"
+            cat response.json
+
+            if [ "$HTTP_STATUS" -eq 200 ]; then
+              ACTION=$(jq -r '.action // "unknown"' response.json)
+              CWE=$(jq -r '.classification.cwe_id // "N/A"' response.json)
+
+              echo "✅ Worker Result: $ACTION (CWE: $CWE)"
+
+              if [ "$ACTION" == "pr_opened" ]; then
+                # Extract the fix from the remediation object
+                jq -r '.remediation.fixed_code // .fixed_code // empty' response.json > "$output_path"
+                echo "💾 Patch saved to $output_path"
+              elif [ "$ACTION" == "issue_escalated" ]; then
+                echo "⚠️ Escalated to L4 Manual Queue. No local file generated."
+                rm -f "$output_path"
+              fi
+            else
+              echo "❌ Worker Auth/Communication Failure. Status: $HTTP_STATUS"
+              cat response.json
+              exit 1
+            fi
+          done
+
+      - name: Commit and Push Remediated Code
+        env:
+          # Opt-in to Node 24 to clear deprecation warnings
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+          git add remediated_code/
+
+          if git diff --cached --quiet; then
+            echo "No new remediations to commit (likely escalated or no changes)."
+          else
+            git commit -m "fix(security): automated remediation patch [skip ci]"
+            git push
+            echo "🎉 Pushed remediated code to repository."
+          fi

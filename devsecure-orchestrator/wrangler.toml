@@ -1,0 +1,22 @@
+name = "devsecure-orchestrator"
+main = "src/index.ts"
+compatibility_date = "2025-03-16"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Model IDs — override without redeploying by running: wrangler deploy --var KEY:VALUE
+# or update here and redeploy. Fallback defaults are hardcoded in index.ts.
+CLASSIFIER_MODEL  = "Qwen/Qwen2.5-Coder-7B-Instruct"
+REMEDIATION_MODEL = "Qwen/Qwen2.5-Coder-32B-Instruct"
+
+# Secrets (set values via CLI — never commit actual keys):
+#   wrangler secret put GITHUB_PAT
+#   wrangler secret put HF_API_KEY
+#   wrangler secret put SEED_SECRET
+
+[ai]
+binding = "AI"
+
+[[vectorize]]
+binding = "VECTOR_INDEX"
+index_name = "cwe-knowledge-base"

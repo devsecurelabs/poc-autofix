@@ -1,0 +1,196 @@
+name: Semantic Guard
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  semantic-guard:
+    name: Semantic Guard — Syntax & Test Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Detect changed files
+        id: changed
+        run: |
+          echo "[SEMANTIC_GUARD] Starting semantic validation"
+          git fetch origin ${{ github.base_ref }}
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          echo "All changed files:"
+          echo "$CHANGED"
+
+          # Scope to vulnerable_code/ and remediated_code/ directories
+          SCOPED=$(echo "$CHANGED" | grep -E '^(vulnerable_code|remediated_code)/' || true)
+          echo "Scoped files:"
+          echo "$SCOPED"
+
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$SCOPED" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python (if .py files in scope)
+        if: contains(steps.changed.outputs.files, '.py')
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node (if .js/.ts files in scope)
+        if: >
+          contains(steps.changed.outputs.files, '.js') ||
+          contains(steps.changed.outputs.files, '.ts')
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Validate each changed file
+        env:
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          set -euo pipefail
+          FAILED=0
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "[SEMANTIC_GUARD] No scoped files changed — skipping validation."
+            echo "[SEMANTIC_GUARD] PASSED"
+            exit 0
+          fi
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            [ ! -f "$file" ] && echo "[SEMANTIC_GUARD] SKIP (deleted): $file" && continue
+
+            ext="${file##*.}"
+            echo ""
+            echo "--- Validating: $file (language: $ext) ---"
+
+            case "$ext" in
+
+              py)
+                echo "Running: python -m py_compile $file"
+                if python -m py_compile "$file"; then
+                  echo "[SEMANTIC_GUARD] PASS: $file"
+                else
+                  echo "[SEMANTIC_GUARD] FAILED: syntax error in $file"
+                  FAILED=1
+                fi
+                ;;
+
+              js|ts)
+                if [ -f "package.json" ]; then
+                  echo "package.json detected — installing dependencies"
+                  if [ -f "package-lock.json" ]; then
+                    npm ci --prefer-offline 2>/dev/null || npm install --prefer-offline
+                  else
+                    npm install --prefer-offline
+                  fi
+
+                  # Attempt build if script exists
+                  if node -e "const p=require('./package.json'); process.exit(p.scripts&&p.scripts.build?0:1)" 2>/dev/null; then
+                    echo "Running: npm run build"
+                    if npm run build; then
+                      echo "[SEMANTIC_GUARD] PASS (build): $file"
+                    else
+                      echo "[SEMANTIC_GUARD] FAILED: build failed for $file"
+                      FAILED=1
+                    fi
+                  else
+                    echo "No build script — falling back to node --check"
+                    if node --check "$file" 2>&1; then
+                      echo "[SEMANTIC_GUARD] PASS (node --check): $file"
+                    else
+                      echo "[SEMANTIC_GUARD] FAILED: syntax error in $file"
+                      FAILED=1
+                    fi
+                  fi
+                else
+                  echo "No package.json — running node --check"
+                  if node --check "$file" 2>&1; then
+                    echo "[SEMANTIC_GUARD] PASS (node --check): $file"
+                  else
+                    echo "[SEMANTIC_GUARD] FAILED: syntax error in $file"
+                    FAILED=1
+                  fi
+                fi
+                ;;
+
+              php)
+                if command -v php &>/dev/null; then
+                  echo "Running: php -l $file"
+                  if php -l "$file"; then
+                    echo "[SEMANTIC_GUARD] PASS: $file"
+                  else
+                    echo "[SEMANTIC_GUARD] FAILED: syntax error in $file"
+                    FAILED=1
+                  fi
+                else
+                  echo "php not available — installing"
+                  sudo apt-get install -y php-cli -q
+                  if php -l "$file"; then
+                    echo "[SEMANTIC_GUARD] PASS: $file"
+                  else
+                    echo "[SEMANTIC_GUARD] FAILED: syntax error in $file"
+                    FAILED=1
+                  fi
+                fi
+                ;;
+
+              *)
+                echo "[SEMANTIC_GUARD] No validator available for extension: $ext — skipping $file"
+                ;;
+            esac
+
+          done <<< "$CHANGED_FILES"
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo ""
+            echo "[SEMANTIC_GUARD] FAILED — one or more files failed validation."
+            exit 1
+          fi
+
+          echo ""
+          echo "[SEMANTIC_GUARD] All file validations passed."
+
+      - name: Run test suite (if available)
+        run: |
+          set -euo pipefail
+          RAN_TESTS=0
+
+          # Python tests
+          if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+            if python -m pytest --version &>/dev/null 2>&1; then
+              echo "[SEMANTIC_GUARD] Running pytest"
+              if python -m pytest --tb=short -q; then
+                echo "[SEMANTIC_GUARD] pytest PASSED"
+              else
+                echo "[SEMANTIC_GUARD] FAILED — pytest test failure"
+                exit 1
+              fi
+              RAN_TESTS=1
+            fi
+          fi
+
+          # Node tests
+          if [ -f "package.json" ]; then
+            if node -e "const p=require('./package.json'); process.exit(p.scripts&&p.scripts.test?0:1)" 2>/dev/null; then
+              echo "[SEMANTIC_GUARD] Running npm test"
+              if npm test; then
+                echo "[SEMANTIC_GUARD] npm test PASSED"
+              else
+                echo "[SEMANTIC_GUARD] FAILED — npm test failure"
+                exit 1
+              fi
+              RAN_TESTS=1
+            fi
+          fi
+
+          if [ "$RAN_TESTS" -eq 0 ]; then
+            echo "[SEMANTIC_GUARD] No test runner detected — test gate skipped."
+          fi
+
+          echo "[SEMANTIC_GUARD] PASSED"
