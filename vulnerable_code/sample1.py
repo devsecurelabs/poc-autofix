@@ -7,7 +7,8 @@ def get_user_by_id(user_id):
     
     # VULNERABILITY: Raw string formatting allows SQL Injection
     # An attacker could provide "1; DROP TABLE users;" 
-    query = "SELECT username, email FROM users WHERE id = %s" % user_id
+    query = "SELECT username, email FROM users WHERE id = ?"
+    cursor.execute(query, (user_id,))
     
     try:
         cursor.execute(query)
