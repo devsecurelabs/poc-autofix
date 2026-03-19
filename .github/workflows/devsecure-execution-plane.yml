@@ -1,0 +1,205 @@
+# =============================================================================
+# DevSecure L1: Detection & Routing
+# =============================================================================
+#
+# Architectural role: Detection Normalisation Layer (L1 Execution Plane)
+#
+# This workflow acts exclusively as a silent enrichment pipeline:
+#   1. Runs OpenGrep (Semgrep OSS) as an oracle — it supplies file locations
+#      and optional CVE reference signals only.
+#   2. Discards all scanner-derived taxonomy: severity, confidence, and CWE
+#      are NEVER forwarded. DevSecure's LLM Classification Plane owns those.
+#   3. Dispatches a normalised payload per finding to the Cloudflare Worker
+#      Orchestrator, which runs the full LLM → Patch Guard → Judge pipeline.
+#
+# OpenGrep/Semgrep is a silent oracle, not the source of truth.
+# =============================================================================
+
+name: "DevSecure L1: Detection & Routing"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  devsecure-l1:
+    name: "L1 — Scan, Normalise, Dispatch"
+    runs-on: ubuntu-latest
+
+    # Minimal permissions: read code, write PRs/issues via the orchestrator
+    permissions:
+      contents: read
+
+    env:
+      RESULTS_FILE: semgrep-results.json
+      # Repository slug forwarded to the orchestrator for branch/PR operations
+      TARGET_REPO: ${{ github.repository }}
+      # Branch that triggered the run — used as base_branch in the payload
+      BASE_BRANCH: ${{ github.ref_name }}
+
+    steps:
+
+      # ------------------------------------------------------------------
+      # 1. Checkout
+      # ------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # 2. Install Semgrep (OpenGrep OSS)
+      # ------------------------------------------------------------------
+      - name: Install Semgrep
+        run: pip install semgrep --quiet
+
+      # ------------------------------------------------------------------
+      # 3. Run OpenGrep oracle scan
+      #
+      # IMPORTANT: continue-on-error is true — findings do NOT block CI.
+      # DevSecure's deterministic gates and PR/issue routing handle blocking;
+      # a raw CI failure here would bypass the full verification pipeline.
+      #
+      # Rulesets used: auto (OSS defaults).  The --json output is written to
+      # $RESULTS_FILE for downstream jq extraction.
+      # ------------------------------------------------------------------
+      - name: Run OpenGrep oracle scan
+        continue-on-error: true
+        run: |
+          semgrep scan \
+            --config auto \
+            --json \
+            --output "$RESULTS_FILE" \
+            --quiet \
+            . || true
+
+          # Ensure a valid JSON file exists even when semgrep exits non-zero
+          # (e.g., no rules matched).  Downstream jq will handle empty arrays.
+          if [ ! -f "$RESULTS_FILE" ]; then
+            echo '{"results":[]}' > "$RESULTS_FILE"
+          fi
+
+      # ------------------------------------------------------------------
+      # 4. Payload normalisation & dispatch
+      #
+      # Detection Normalisation Layer rules (strictly enforced):
+      #   EXTRACT  → file path, CVE reference (null-safe)
+      #   DISCARD  → severity, confidence, CWE, rule metadata, message text
+      #
+      # For each finding the step:
+      #   a. Reads the vulnerable file content and base64-encodes it for
+      #      safe transport in the JSON body.
+      #   b. Extracts the CVE reference from semgrep's 'metadata.cve' or
+      #      'metadata.references' (first CVE-prefixed URL); falls back to ""
+      #      so zero-day / internal findings are handled gracefully.
+      #   c. Posts to the Cloudflare Worker Orchestrator.
+      #
+      # Only the FIRST finding is dispatched in this PoC to keep the demo
+      # deterministic.  Remove `| head -1` to process all findings.
+      # ------------------------------------------------------------------
+      - name: Normalise findings and dispatch to orchestrator
+        env:
+          ORCHESTRATOR_SECRET: ${{ secrets.DEVSECURE_SECRET }}
+          GITHUB_PAT_FOR_WORKER: ${{ secrets.DEVSECURE_GITHUB_PAT }}
+        run: |
+          set -euo pipefail
+
+          ORCHESTRATOR_URL="https://devsecure-orchestrator.quadri-jay.workers.dev/remediate"
+
+          # Count findings — exit cleanly if the scan found nothing
+          FINDING_COUNT=$(jq '.results | length' "$RESULTS_FILE")
+          echo "OpenGrep findings: $FINDING_COUNT"
+
+          if [ "$FINDING_COUNT" -eq 0 ]; then
+            echo "No findings — nothing to dispatch."
+            exit 0
+          fi
+
+          # ── Process first finding only (PoC mode) ─────────────────────
+          # To process all findings, replace `.[0:1]` with `.[]`
+          jq -c '.[0:1][]' "$RESULTS_FILE".results 2>/dev/null \
+            || jq -c '.results[0:1][]' "$RESULTS_FILE" \
+            | while IFS= read -r finding; do
+
+            # --- Extract: file path only ---------------------------------
+            FILE_PATH=$(echo "$finding" | jq -r '.path // ""')
+
+            if [ -z "$FILE_PATH" ] || [ ! -f "$FILE_PATH" ]; then
+              echo "Skipping finding — file path missing or unreadable: $FILE_PATH"
+              continue
+            fi
+
+            # --- Extract: CVE reference (silent oracle signal) -----------
+            # Try metadata.cve first, then scan references[] for CVE-* prefix.
+            # Falls back to "" (empty string) — zero-days are valid inputs.
+            CVE_ID=$(echo "$finding" | jq -r '
+              .extra.metadata.cve //
+              (.extra.metadata.references[]? | select(test("CVE-[0-9]+-[0-9]+";"i"))) //
+              ""
+            ' 2>/dev/null | grep -oP 'CVE-\d+-\d+' | head -1 || true)
+
+            echo "Finding → file: $FILE_PATH | cve: ${CVE_ID:-<none>}"
+
+            # --- Detect language from file extension ---------------------
+            EXTENSION="${FILE_PATH##*.}"
+            case "$EXTENSION" in
+              py)           LANGUAGE="python"     ;;
+              js|mjs|cjs)   LANGUAGE="javascript" ;;
+              ts)           LANGUAGE="typescript" ;;
+              php)          LANGUAGE="php"        ;;
+              java)         LANGUAGE="java"       ;;
+              go)           LANGUAGE="go"         ;;
+              rb)           LANGUAGE="ruby"       ;;
+              *)            LANGUAGE="$EXTENSION" ;;
+            esac
+
+            # --- Encode file content (safe JSON transport) ---------------
+            # base64 -w0 disables line-wrapping on Linux; safeAtob in the
+            # worker already strips whitespace, so this is belt-and-suspenders.
+            CODE_B64=$(base64 -w0 < "$FILE_PATH")
+
+            # --- Build normalised payload --------------------------------
+            # Taxonomy moat: severity / confidence / CWE are never included.
+            # cve_id is passed as an empty string when absent — the Worker's
+            # Pseudo-RPS engine handles the zero-day path automatically.
+            PAYLOAD=$(jq -n \
+              --arg repo        "$TARGET_REPO" \
+              --arg file_path   "$FILE_PATH" \
+              --arg code        "$CODE_B64" \
+              --arg language    "$LANGUAGE" \
+              --arg base_branch "$BASE_BRANCH" \
+              --arg cve_id      "${CVE_ID:-}" \
+              '{
+                repo:        $repo,
+                file_path:   $file_path,
+                code:        $code,
+                language:    $language,
+                base_branch: $base_branch,
+                cve_id:      (if $cve_id == "" then null else $cve_id end)
+              }')
+
+            # --- Dispatch to orchestrator --------------------------------
+            echo "Dispatching to orchestrator..."
+            HTTP_STATUS=$(curl -s -o /tmp/orchestrator-response.json -w "%{http_code}" \
+              -X POST "$ORCHESTRATOR_URL" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer $ORCHESTRATOR_SECRET" \
+              --max-time 120 \
+              --retry 2 \
+              --retry-delay 5 \
+              -d "$PAYLOAD")
+
+            echo "Orchestrator HTTP status: $HTTP_STATUS"
+            echo "Orchestrator response:"
+            cat /tmp/orchestrator-response.json | jq '.' 2>/dev/null || cat /tmp/orchestrator-response.json
+
+            # A 200 from the orchestrator means the pipeline ran (PR or Issue).
+            # Any other status is a dispatch failure — log it but don't fail CI
+            # so the security gate is never bypassed by an infra blip.
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "⚠️  Orchestrator returned HTTP $HTTP_STATUS — dispatch failed. Manual review required."
+            fi
+
+          done
+
+          echo "L1 dispatch complete."
