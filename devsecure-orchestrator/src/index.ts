@@ -122,24 +122,29 @@ async function classify(
   env: Env,
 ): Promise<ClassificationResult> {
   const system = `You are a senior application security engineer specialising in static analysis.
-Analyse the provided source code and return ONLY raw JSON. No markdown formatting, no backticks, no explanations.
-
-Required schema:
+Return ONLY valid JSON. No markdown, no explanation.
+Schema:
 {
-  "cwe_id":     "CWE-<number>",
-  "cwe_name":   "<short CWE name>",
-  "confidence": <0.0-1.0>,
-  "lane":       <1|2|3|4>,
-  "summary":    "<one sentence describing the vulnerability and its location>"
+  "cwe_id": "string",
+  "cwe_name": "string",
+  "confidence": number (0-1),
+  "lane": number (1-4),
+  "summary": "string"
+}
+If you cannot classify, return EXACTLY:
+{
+  "cwe_id": "UNKNOWN",
+  "cwe_name": "Unknown",
+  "confidence": 0,
+  "lane": 4,
+  "summary": "Unable to classify"
 }
 
 Lane assignment guide:
   1 — Trivial: rename, constant swap, single-line sanitiser call
   2 — Localised: logic change within one function, parameterised query, encoding fix
   3 — Moderate: multi-function refactor, interface change, new dependency required
-  4 — Architectural or cannot assess: systemic design flaw, insufficient context
-
-Output the JSON object and nothing else. Do not wrap it in a code block.`;
+  4 — Architectural or cannot assess: systemic design flaw, insufficient context`;
 
   const user = `Language: ${language}\n\nVulnerable code:\n\`\`\`${language}\n${code}\n\`\`\``;
 
@@ -151,23 +156,23 @@ Output the JSON object and nothing else. Do not wrap it in a code block.`;
     512,
   );
 
-  // Sanitise: slice from first '{' to last '}' to strip any surrounding markdown or prose
-  const first = raw.indexOf("{");
-  const last  = raw.lastIndexOf("}");
-  if (first === -1 || last === -1 || last <= first) {
+  // Extract JSON payload: regex greedily captures from first '{' to last '}'
+  // stripping any surrounding markdown, prose, or code-fence wrapping.
+  const match     = raw.match(/\{[\s\S]*\}/);
+  const cleanText = match ? match[0] : raw;
+
+  if (!match) {
     console.error(JSON.stringify({ event: "classify_no_json", raw_output: raw.slice(0, 500) }));
-    throw new Error(`L2 Classifier returned no JSON object. Raw: ${raw.slice(0, 300)}`);
   }
-  const jsonSlice = raw.slice(first, last + 1);
 
   try {
-    return JSON.parse(jsonSlice) as ClassificationResult;
+    return JSON.parse(cleanText) as ClassificationResult;
   } catch (parseErr) {
     console.error(JSON.stringify({
       event:       "classify_json_parse_failed",
       error:       parseErr instanceof Error ? parseErr.message : String(parseErr),
       raw_output:  raw.slice(0, 500),
-      json_slice:  jsonSlice.slice(0, 500),
+      clean_text:  cleanText.slice(0, 500),
     }));
     // Graceful fallback — complete object so downstream code never starves on missing fields.
     // Zero confidence + lane 4 ensures the confidence gate blocks and escalates to L4.
