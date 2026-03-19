@@ -5,8 +5,8 @@ def get_user_by_id(user_id):
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
     
-    # VULNERABILITY: Raw string formatting allows SQL Injection 
-    # An attacker could provide "1; DROP TABLE users;"  
+    # VULNERABILITY: Raw string formatting allows SQL Injection  
+    # An attacker could provide "1; DROP TABLE users;" 
     query = "SELECT username, email FROM users WHERE id = %s" % user_id
     
     try:
