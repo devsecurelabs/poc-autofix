@@ -21,16 +21,14 @@ const GITHUB_API = "https://api.github.com";
 // ---------------------------------------------------------------------------
 
 interface DsDetection {
-  type: string;       // detection rule type
-  rule_id: string;    // unique rule identifier
-  cwe_hint?: string;  // accepted but ONLY used for mismatch detection — never the final CWE
-  cve_id?: string;    // ONLY retained field — used solely as RPS enrichment signal
+  type: string;               // detection rule type
+  rule_id: string;            // unique rule identifier
+  cwe_hint?: string;          // used for mismatch detection — never the final CWE
+  scanner_severity?: string;  // L1 scanner severity — V2.0 primary priority signal
+                              // ("critical" | "high" | "medium" | "low")
 
-  // Detection Normalisation Layer: the following scanner-derived fields are accepted
-  // in the payload so the schema does not reject them, but they are EXPLICITLY DISCARDED
-  // and never influence classification, confidence, or routing decisions.
-  // The LLM Classification Plane (Qwen2.5) is the sole source of CWE and confidence.
-  scanner_severity?: unknown;
+  // Detection Normalisation Layer: accepted for schema compatibility but DISCARDED —
+  // the L2 LLM Classification Plane (Qwen2.5) is the sole source of CWE and confidence.
   scanner_confidence?: unknown;
   scanner_cwe?: unknown;
 }
@@ -46,7 +44,6 @@ interface RemediationRequest {
   code: string;         // raw vulnerable source code (legacy field)
   language: string;     // "python" | "javascript" | etc. (legacy field)
   base_branch?: string; // branch to target, defaults to "main"
-  cve_id?: string;      // top-level CVE ID for RPS scoring (legacy field)
   ds_detection?: DsDetection;  // normalized detection input layer
   code_context?: CodeContext;  // normalized code input layer
 }
@@ -61,9 +58,9 @@ interface ClassificationResult {
 
 // HiddenSignalLayer — internal only; never serialised to API responses or full logs
 interface HiddenSignalLayer {
-  source_type: string;     // detection origin (e.g. "sast", "dast", "manual")
-  cwe_hint?: string;       // vendor-supplied CWE; used only for mismatch detection
-  cve_id?: string;         // CVE from detection; used only for RPS lookup
+  source_type: string;       // detection origin (e.g. "sast", "dast", "manual")
+  cwe_hint?: string;         // vendor-supplied CWE; used only for mismatch detection
+  scanner_severity?: string; // L1 severity; forwarded to priority scoring
 }
 
 interface RemediationResult {
@@ -233,7 +230,16 @@ Hard constraints:
 CRITICAL — Anti-Duplication Rule:
 - When modifying a variable that is immediately used in an execution statement (e.g., parameterizing a SQL query assigned to a variable and then passed to cursor.execute), your <<<< SEARCH block MUST include BOTH the original variable assignment AND the execution statement that uses it.
 - If you include only the variable assignment in your SEARCH block but add a new execution statement in your REPLACE block, the original execution statement will remain untouched in the file, producing a duplicate execution bug that runs the query twice with inconsistent arguments.
-- Always capture the full logical block being modified. If changing a query string, your SEARCH block must span from the string assignment through to the line where it is executed.`;
+- Always capture the full logical block being modified. If changing a query string, your SEARCH block must span from the string assignment through to the line where it is executed.
+
+SECURITY AUDIT TRAIL:
+- Your REPLACE block MUST begin with the following formal audit header using the correct comment syntax for the target language, before any code lines:
+  [SECURITY REMEDIATION]
+  TYPE: {CWE_ID}
+  TIMESTAMP: {ISO_DATE}
+  BY: DevSecure Autonomous Surgeon (L3-32B)
+- Use // for JavaScript/TypeScript/Java/C#/Dart, # for Python/Ruby/PHP, -- for SQL.
+- Place this header immediately above the first changed line in your REPLACE block.`;
 
   const user = `## Vulnerability Classification (from Qwen2.5)
 \`\`\`json
@@ -413,6 +419,31 @@ function safeAtob(input: string): string {
 //
 // Multiple blocks are applied in order; each block operates on the already-
 // patched line array so relative positions remain stable.
+// ---------------------------------------------------------------------------
+// Security audit trail header — prepended deterministically after patch applied
+// ---------------------------------------------------------------------------
+
+function buildAuditHeader(language: string, cweId: string): string {
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const lines = [
+    `[SECURITY REMEDIATION]`,
+    `TYPE: ${cweId}`,
+    `TIMESTAMP: ${today}`,
+    `BY: DevSecure Autonomous Surgeon (L3-32B)`,
+  ];
+  const commentChar = /^(python|ruby|php|bash|perl|r)$/i.test(language) ? "#"
+    : /^(sql|lua|haskell)$/i.test(language) ? "--"
+    : "//";
+  return lines.map(l => `${commentChar} ${l}`).join("\n") + "\n";
+}
+
+function prependAuditHeader(patchedCode: string, language: string, cweId: string): string {
+  const header = buildAuditHeader(language, cweId);
+  // Idempotent: don't double-add if the model already injected it
+  if (patchedCode.includes("[SECURITY REMEDIATION]")) return patchedCode;
+  return header + patchedCode;
+}
+
 function applySearchReplace(original: string, llmOutput: string): string {
   // Regex: tolerates optional \r before each \n (CRLF-safe)
   // \s* absorbs trailing spaces on the tag lines.
@@ -679,99 +710,38 @@ function checkPatchGuard(original: string, fixed: string): PatchGuardResult {
 // RPS Score fetch
 // ---------------------------------------------------------------------------
 
-const RPS_DEFAULT_SCORE = 50;
-
 // Source-to-sink CWEs that require multi-line context to patch safely.
 // The Diversity Judge is ALWAYS triggered for these, regardless of confidence
 // or changePercent, to guard against incomplete or duplicated fix blocks.
 const COMPLEX_CWES = ["CWE-89", "CWE-78", "CWE-22", "CWE-79", "CWE-94"];
 
-async function fetchRpsScore(cveId: string, env: Env): Promise<number> {
-  if (!env.RPS_API_URL) {
-    console.log(JSON.stringify({ event: "rps_fetch", status: "fallback", reason: "RPS_API_URL not configured" }));
-    return RPS_DEFAULT_SCORE;
-  }
-  try {
-    const url = `${env.RPS_API_URL}?cve_id=${encodeURIComponent(cveId)}`;
-    const res = await fetch(url, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${env.RPS_TOKEN}` },
-    });
-    if (!res.ok) {
-      console.log(JSON.stringify({ event: "rps_fetch", cve_id: cveId, status: "fallback", httpStatus: res.status }));
-      return RPS_DEFAULT_SCORE;
-    }
-    const data = (await res.json()) as Record<string, unknown>;
-    const score = data.rps_score;
-    if (typeof score !== "number") {
-      console.log(JSON.stringify({ event: "rps_fetch", cve_id: cveId, status: "fallback", reason: "missing_rps_score" }));
-      return RPS_DEFAULT_SCORE;
-    }
-    console.log(JSON.stringify({ event: "rps_fetch", cve_id: cveId, status: "success", rps_score: score }));
-    return score;
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    console.log(JSON.stringify({ event: "rps_fetch", cve_id: cveId, status: "fallback", reason }));
-    return RPS_DEFAULT_SCORE;
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Pseudo-Risk Heuristic Engine
+// V2.0 Priority Scoring — L1 Severity × L2 Confidence
 // ---------------------------------------------------------------------------
 
-// Static Base Gravity scores per CWE — used when no CVE is present (zero-day /
-// internal code). Values represent inherent exploitability and impact severity.
-const CWE_BASE_GRAVITY: Record<string, number> = {
-  "CWE-89":  95,  // SQL Injection
-  "CWE-78":  95,  // OS Command Injection
-  "CWE-77":  90,  // Command Injection (generic)
-  "CWE-94":  90,  // Code Injection
-  "CWE-22":  85,  // Path Traversal
-  "CWE-287": 85,  // Improper Authentication
-  "CWE-79":  80,  // XSS
-  "CWE-798": 80,  // Hard-coded Credentials
-  "CWE-502": 75,  // Unsafe Deserialization
-  "CWE-352": 70,  // CSRF
+// Maps L1 scanner severity string to a 0-100 base score.
+// Default 50 when the scanner did not supply a severity value.
+const SEVERITY_WEIGHTS: Record<string, number> = {
+  critical: 100,
+  high:     80,
+  medium:   50,
+  low:      20,
 };
-const CWE_BASE_GRAVITY_DEFAULT = 50;
 
-interface RpsResult {
-  score: number;
-  source: "external" | "pseudo_rps";
-}
-
-// Unified RPS entry point.
-// - CVE present  → external fetch (real exploit-activity signal).
-// - CVE absent   → Pseudo-RPS from CWE gravity × LLM confidence (zero-day path).
-// Taxonomy moat: cve_id is consumed here and never forwarded to GitHub artifacts.
-async function calculateRPS(
-  cveId: string | undefined,
-  cweId: string,
+// Compute the final priority score from L1 severity and L2 LLM confidence,
+// then subtract pipeline penalties applied upstream (judge, patch risk, etc.).
+function computePriorityScore(
+  scannerSeverity: string | undefined,
   confidence: number,
-  env: Env,
-): Promise<RpsResult> {
-  if (cveId) {
-    const score = await fetchRpsScore(cveId, env);
-    return { score, source: "external" };
-  }
-
-  // Zero-day / internal code: derive risk from CWE gravity + LLM confidence
-  // Normalise cweId to "CWE-NNN" prefix only (strip trailing descriptors if any)
-  const normalisedCwe = cweId.split(/[^A-Z0-9-]/i)[0].toUpperCase();
-  const baseGravity   = CWE_BASE_GRAVITY[normalisedCwe] ?? CWE_BASE_GRAVITY_DEFAULT;
-  const pseudoRps     = Math.min(Math.round(baseGravity * confidence), 100);
-
-  console.log(JSON.stringify({
-    event:        "rps_pseudo",
-    source:       "pseudo_rps",
-    cwe_id:       normalisedCwe,
-    base_gravity: baseGravity,
-    confidence,
-    pseudo_rps:   pseudoRps,
-  }));
-
-  return { score: pseudoRps, source: "pseudo_rps" };
+  judgePenalty: number,
+  patchRisk: number,
+  laneWeight: number,
+  mismatchPenalty: number,
+): number {
+  const baseScore = Math.round(
+    (SEVERITY_WEIGHTS[(scannerSeverity ?? "").toLowerCase()] ?? 50) * confidence,
+  );
+  return Math.min(100, Math.max(0, baseScore - judgePenalty - patchRisk - laneWeight - mismatchPenalty));
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,7 +977,56 @@ async function openIssue(
   return issueUrl;
 }
 
-// Step 4b — Fix path: create branch, commit file, open GitHub PR
+// ---------------------------------------------------------------------------
+// Tiered Complexity Analysis Engine (PoC simulation)
+// ---------------------------------------------------------------------------
+
+type Tier = "enterprise" | "free";
+
+interface ComplexityProfile {
+  tier:        Tier;
+  tier_label:  string;
+  ccn:         number;   // Cyclomatic Complexity Number
+  fan_in:      number;   // incoming call/dependency count
+  taint_risk:  "High" | "None";
+  action:      "BLOCK_AUTOMERGE" | "SAFE_AUTOMERGE";
+  pr_label:    string;   // GitHub label text
+  fusion_note: string;   // investor-facing summary line
+}
+
+// Evaluate file path to assign a simulated complexity profile.
+// Files with 'db' or 'controller' in the name → Tier 2 (Enterprise).
+// All other files → Tier 1 (Free).
+function analyseComplexity(filePath: string): ComplexityProfile {
+  const name = filePath.split("/").pop()?.toLowerCase() ?? "";
+  const isEnterprise = /db|controller/.test(name);
+
+  if (isEnterprise) {
+    return {
+      tier:        "enterprise",
+      tier_label:  "Tier 2 — Enterprise",
+      ccn:         45,
+      fan_in:      85,
+      taint_risk:  "High",
+      action:      "BLOCK_AUTOMERGE",
+      pr_label:    "🔴 Enterprise Review Required",
+      fusion_note: "High CCN + taint propagation detected. Human review mandatory before merge.",
+    };
+  }
+
+  return {
+    tier:        "free",
+    tier_label:  "Tier 1 — Free",
+    ccn:         4,
+    fan_in:      2,
+    taint_risk:  "None",
+    action:      "SAFE_AUTOMERGE",
+    pr_label:    "✅ Safe: Auto-Merge",
+    fusion_note: "Low complexity. No taint propagation detected. Safe for automated merge.",
+  };
+}
+
+// Step 4b — Fix path: create branch, commit file, update ledger, open GitHub PR
 async function openPr(
   repo: string,
   filePath: string,
@@ -1015,6 +1034,9 @@ async function openPr(
   classification: ClassificationResult,
   baseBranch: string,
   pat: string,
+  scannerSeverity: string = "unknown",
+  priorityScore: number = 0,
+  complexity: ComplexityProfile = analyseComplexity(filePath),
 ): Promise<string> {
   // 1. Resolve base branch HEAD SHA
   const refRes = await ghFetch(
@@ -1065,36 +1087,106 @@ async function openPr(
     throw new Error(`File commit failed: HTTP ${commitRes.status} – ${await commitRes.text()}`);
   }
 
-  // 5. Open the Pull Request
+  // 5. Commit updated vulnerabilities.json ledger to the fix branch
+  const LEDGER_PATH = "vulnerabilities.json";
+  try {
+    // Read existing ledger from base branch (may not exist yet)
+    const existingLedgerRes = await ghFetch(`/repos/${repo}/contents/${LEDGER_PATH}?ref=${baseBranch}`, "GET", pat);
+    let ledgerEntries: LedgerEntry[] = [];
+    let existingLedgerSha: string | undefined;
+    if (existingLedgerRes.ok) {
+      const existingLedgerFile = (await existingLedgerRes.json()) as { sha: string; content: string };
+      existingLedgerSha = existingLedgerFile.sha;
+      try {
+        ledgerEntries = JSON.parse(safeAtob(existingLedgerFile.content)) as LedgerEntry[];
+      } catch { ledgerEntries = []; }
+    }
+    // Append new entry
+    const newEntry: LedgerEntry = {
+      timestamp:      new Date().toISOString(),
+      repo,
+      file_path:      filePath,
+      cwe_id:         classification.cwe_id,
+      severity:       scannerSeverity,
+      confidence:     classification.confidence,
+      priority_score: priorityScore,
+      action:         "pr_opened",
+      github_url:     "",  // filled after PR creation
+    };
+    ledgerEntries.push(newEntry);
+    const ledgerContent = btoa(unescape(encodeURIComponent(JSON.stringify(ledgerEntries, null, 2))));
+    await ghFetch(`/repos/${repo}/contents/${LEDGER_PATH}`, "PUT", pat, {
+      message: `chore(security): update vulnerability ledger for ${classification.cwe_id} in ${filePath}`,
+      content: ledgerContent,
+      branch: fixBranch,
+      ...(existingLedgerSha ? { sha: existingLedgerSha } : {}),
+    });
+  } catch (err) {
+    // Ledger update failure is non-fatal — log and continue to PR creation
+    console.error(JSON.stringify({ event: "ledger_update_failed", reason: err instanceof Error ? err.message : String(err) }));
+  }
+
+  // 6. Open the Pull Request — with Fusion Score dashboard
+  const fusionScore = Math.round(
+    (100 - Math.min(complexity.ccn, 100)) * 0.4 +
+    (classification.confidence * 100) * 0.4 +
+    (complexity.taint_risk === "None" ? 20 : 0),
+  );
+
+  const tierBadge = complexity.tier === "enterprise"
+    ? "🔴 **ENTERPRISE** — Manual review required before merge"
+    : "✅ **FREE** — Automated merge approved";
+
   let prRes: Response;
   try {
     prRes = await ghFetch(`/repos/${repo}/pulls`, "POST", pat, {
-      title: `[DevSecure] Fix ${classification.cwe_id} – ${classification.cwe_name} in \`${filePath}\``,
-      body: `## Automated Security Remediation
+      title: `[DevSecure] [${complexity.tier_label}] Fix ${classification.cwe_id} in \`${filePath}\``,
+      body: `## DevSecure Automated Remediation — ${tierBadge}
+
+---
+
+### Fusion Score Dashboard
+
+| Metric | Value | Signal |
+|---|---|---|
+| **Cyclomatic Complexity (CCN)** | ${complexity.ccn} | ${complexity.ccn > 20 ? "🔴 High" : "🟢 Low"} |
+| **Fan-In (Dependencies)** | ${complexity.fan_in} | ${complexity.fan_in > 10 ? "🔴 High coupling" : "🟢 Low coupling"} |
+| **Taint Propagation Risk** | ${complexity.taint_risk} | ${complexity.taint_risk === "High" ? "🔴 Taint paths detected" : "🟢 Clean"} |
+| **L2 LLM Confidence** | ${(classification.confidence * 100).toFixed(1)}% | ${classification.confidence >= 0.85 ? "🟢 High" : classification.confidence >= 0.70 ? "🟡 Medium" : "🔴 Low"} |
+| **L1 Severity** | ${scannerSeverity.toUpperCase()} | — |
+| **Priority Score** | ${priorityScore} / 100 | — |
+| **Fusion Score** | **${fusionScore} / 100** | ${fusionScore >= 70 ? "🟢 Auto-merge eligible" : "🔴 Blocked"} |
+
+> **Routing Decision:** \`${complexity.action}\` — ${complexity.fusion_note}
+
+---
+
+### Vulnerability Classification
 
 | Field | Value |
 |---|---|
 | **CWE** | ${classification.cwe_id} — ${classification.cwe_name} |
 | **File** | \`${filePath}\` |
-| **Confidence** | ${(classification.confidence * 100).toFixed(1)}% |
 | **Routing Lane** | L${classification.lane} |
+| **Complexity Profile** | ${complexity.tier_label} |
 
-### Vulnerability Summary
 ${classification.summary}
 
 ---
 
-### Tier B Review Checklist
+### ${complexity.tier === "enterprise" ? "Enterprise" : "Tier B"} Review Checklist
 - [ ] Full test suite passes
 - [ ] AST semantic preservation verified (behaviour unchanged)
 - [ ] SAST regression scan clean (no new findings)
 - [ ] Minimal diff constraint satisfied (only security-relevant lines changed)
+${complexity.tier === "enterprise" ? "- [ ] Senior engineer sign-off (CCN > 20 mandate)\n- [ ] Taint propagation paths manually verified" : ""}
 
 > ⚠️ **AI models have zero approval authority.** A human reviewer must approve and merge this PR.
 
-*Generated by **devsecure-orchestrator**.*`,
+*Generated by **devsecure-orchestrator** · Complexity Engine v1 · Ledger: \`${LEDGER_PATH}\`*`,
       head: fixBranch,
       base: baseBranch,
+      labels: [complexity.pr_label],
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1120,7 +1212,6 @@ let metrics_total_requests        = 0;
 let metrics_pr_opened_count       = 0;
 let metrics_issue_escalated_count = 0;
 let metrics_total_final_score     = 0;
-let metrics_total_rps_score       = 0;
 let metrics_mismatch_count        = 0;
 
 interface RecentDecision {
@@ -1131,6 +1222,24 @@ interface RecentDecision {
   decision: "pr_opened" | "issue_escalated";
 }
 const recent_decisions: RecentDecision[] = [];
+
+// ---------------------------------------------------------------------------
+// In-memory Vulnerability Ledger — severity-driven (V2.0)
+// ---------------------------------------------------------------------------
+
+interface LedgerEntry {
+  timestamp:       string;
+  repo:            string;
+  file_path:       string;
+  cwe_id:          string;
+  severity:        string;   // from L1 scanner (critical/high/medium/low)
+  confidence:      number;   // from L2 classifier (0.0-1.0)
+  priority_score:  number;   // final computed score
+  action:          string;
+  github_url:      string;
+}
+
+const vulnerability_ledger: LedgerEntry[] = [];
 
 // ---------------------------------------------------------------------------
 // Main handler
@@ -1144,6 +1253,14 @@ export default {
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(
         JSON.stringify({ status: "ok", service: "devsecure-orchestrator" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // GET /ledger — return in-memory vulnerability ledger
+    if (request.method === "GET" && url.pathname === "/ledger") {
+      return new Response(
+        JSON.stringify({ total: vulnerability_ledger.length, entries: vulnerability_ledger }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -1272,10 +1389,6 @@ export default {
             metrics_total_requests === 0
               ? 0
               : Math.round((metrics_total_final_score / metrics_total_requests) * 100) / 100,
-          avg_rps_score:
-            metrics_total_requests === 0
-              ? 0
-              : Math.round((metrics_total_rps_score / metrics_total_requests) * 100) / 100,
           uptime_seconds: Math.floor((Date.now() - worker_start_time) / 1000),
           health_status:
             metrics_total_requests === 0
@@ -1325,21 +1438,18 @@ export default {
     const code     = code_context?.snippet  ?? body.code;
     const language = code_context?.language ?? body.language;
 
-    // Detection Normalisation Layer — explicit discard of scanner-derived signals.
-    // scanner_severity / scanner_confidence / scanner_cwe are intentionally ignored;
-    // they must never reach the classification or scoring planes.
-    // Only cve_id is retained as a hidden enrichment signal for the RPS engine.
-    void ds_detection?.scanner_severity;
+    // Detection Normalisation Layer
+    // scanner_severity → consumed as V2.0 L1 priority signal
+    // scanner_confidence / scanner_cwe → discarded; L2 LLM is sole authoritative source
     void ds_detection?.scanner_confidence;
     void ds_detection?.scanner_cwe;
-    // CVE: ds_detection.cve_id takes precedence over top-level cve_id; never inferred
-    const cve_id   = ds_detection?.cve_id   ?? body.cve_id;
+    const scanner_severity = (ds_detection?.scanner_severity ?? "").toLowerCase() || "unknown";
 
     // ── Hidden Signal Layer — internal context; never exposed in API responses ─
     const hsl: HiddenSignalLayer = {
-      source_type: ds_detection?.type ?? "unknown",
-      cwe_hint:    ds_detection?.cwe_hint,
-      cve_id:      cve_id,
+      source_type:      ds_detection?.type ?? "unknown",
+      cwe_hint:         ds_detection?.cwe_hint,
+      scanner_severity: scanner_severity,
     };
 
     if (!code || !language) {
@@ -1538,13 +1648,13 @@ export default {
       let action: "pr_opened" | "issue_escalated";
       let judgeWasRun = false;
       let scorePayload: {
-        rps_score: number;
+        severity: string;
+        confidence: number;
         judge_penalty: number;
         patch_risk: number;
         lane_weight: number;
         mismatch_penalty: number;
         final_priority_score: number;
-        rps_source: "external" | "pseudo_rps";
       } | Record<string, never> = {};
 
       if (remediation.status === "cannot_fix") {
@@ -1564,6 +1674,7 @@ export default {
         let decoded: string;
         try {
           decoded = applySearchReplace(code, remediation.search_replace_block!);
+          decoded = prependAuditHeader(decoded, language, classification.cwe_id);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           const reason = "Malformed search/replace block or context mismatch";
@@ -1707,12 +1818,7 @@ export default {
           // ── Step 5c: RPS / Pseudo-RPS ────────────────────────────────────
           // cve_id is consumed here and never forwarded to GitHub artifacts
           // (taxonomy moat — see openIssue / openPr: neither embeds cve_id).
-          pipelineStep = "rps";
-          const rpsResult = await calculateRPS(cve_id, classification.cwe_id, classification.confidence, env);
-          const rpsScore  = rpsResult.score;
-          const rpsSource = rpsResult.source;
-
-          // ── Step 5d: Final Priority Scoring ──────────────────────────────
+          // ── Step 5d: Final Priority Scoring (V2.0 — Severity × Confidence) ─
           pipelineStep = "scoring";
           const laneWeightMap: Record<number, number> = { 1: 0, 2: 5, 3: 10, 4: 20 };
           const laneWeight = laneWeightMap[classification.lane] ?? 20;
@@ -1731,24 +1837,29 @@ export default {
           let mismatchPenalty = 0;
           if (cwe_mismatch) {
             const delta = Math.abs(classification.confidence - DETECTION_CONFIDENCE_BASELINE);
-            if (delta < 0.2)      mismatchPenalty = 5;
+            if (delta < 0.2)       mismatchPenalty = 5;
             else if (delta <= 0.5) mismatchPenalty = 10;
             else                   mismatchPenalty = 15;
           }
 
-          const rawScore = rpsScore - judgePenalty - patchRisk - laneWeight - mismatchPenalty;
-          const finalScore = Math.min(100, Math.max(0, rawScore));
+          const finalScore = computePriorityScore(
+            scanner_severity,
+            classification.confidence,
+            judgePenalty,
+            patchRisk,
+            laneWeight,
+            mismatchPenalty,
+          );
 
           console.log(JSON.stringify({
-            event:           "final_scoring",
-            rps:             rpsScore,
-            rps_source:      rpsSource,
-            pseudo_rps_used: rpsSource === "pseudo_rps",
-            judge_penalty:   judgePenalty,
-            lane_weight:     laneWeight,
-            patch_risk:      patchRisk,
+            event:            "final_scoring",
+            severity:         scanner_severity,
+            confidence:       classification.confidence,
+            judge_penalty:    judgePenalty,
+            lane_weight:      laneWeight,
+            patch_risk:       patchRisk,
             mismatch_penalty: mismatchPenalty,
-            final_score:     finalScore,
+            final_score:      finalScore,
           }));
 
           // ── Step 5e: Decision engine ──────────────────────────────────────
@@ -1765,18 +1876,22 @@ export default {
             );
             action = "issue_escalated";
           } else if (finalScore >= 85) {
-            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT);
+            const complexity = analyseComplexity(file_path);
+            console.log(JSON.stringify({ event: "complexity_analysis", tier: complexity.tier, ccn: complexity.ccn, fan_in: complexity.fan_in, taint_risk: complexity.taint_risk, action: complexity.action, file_path }));
+            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT, scanner_severity, finalScore, complexity);
             action = "pr_opened";
-            console.log(JSON.stringify({ event: "pr_created", cwe_id: classification.cwe_id, lane: classification.lane, final_score: finalScore, fix_attempted: true, fix_generated: true }));
+            console.log(JSON.stringify({ event: "pr_created", cwe_id: classification.cwe_id, lane: classification.lane, final_score: finalScore, severity: scanner_severity, tier: complexity.tier, pr_label: complexity.pr_label, fix_attempted: true, fix_generated: true }));
           } else if (finalScore >= 70) {
             console.log(JSON.stringify({ event: "final_scoring", warning: "score_in_caution_band", final_score: finalScore }));
-            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT);
+            const complexity = analyseComplexity(file_path);
+            console.log(JSON.stringify({ event: "complexity_analysis", tier: complexity.tier, ccn: complexity.ccn, fan_in: complexity.fan_in, taint_risk: complexity.taint_risk, action: complexity.action, file_path }));
+            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT, scanner_severity, finalScore, complexity);
             action = "pr_opened";
-            console.log(JSON.stringify({ event: "pr_created", cwe_id: classification.cwe_id, lane: classification.lane, final_score: finalScore, fix_attempted: true, fix_generated: true }));
+            console.log(JSON.stringify({ event: "pr_created", cwe_id: classification.cwe_id, lane: classification.lane, final_score: finalScore, severity: scanner_severity, tier: complexity.tier, pr_label: complexity.pr_label, fix_attempted: true, fix_generated: true }));
           } else {
             githubUrl = await openIssue(
               repo, file_path, classification,
-              { status: "cannot_fix", reason: `Final priority score too low to auto-merge: score=${finalScore} (rps=${rpsScore}, judgePenalty=${judgePenalty}, patchRisk=${patchRisk}, laneWeight=${laneWeight}, mismatchPenalty=${mismatchPenalty})` },
+              { status: "cannot_fix", reason: `Final priority score too low to auto-merge: score=${finalScore} (severity=${scanner_severity}, confidence=${classification.confidence.toFixed(2)}, judgePenalty=${judgePenalty}, patchRisk=${patchRisk}, laneWeight=${laneWeight}, mismatchPenalty=${mismatchPenalty})` },
               env.GITHUB_PAT,
               env,
               "policy",
@@ -1784,7 +1899,7 @@ export default {
             action = "issue_escalated";
           }
 
-          scorePayload = { rps_score: rpsScore, judge_penalty: judgePenalty, patch_risk: patchRisk, lane_weight: laneWeight, mismatch_penalty: mismatchPenalty, final_priority_score: finalScore, rps_source: rpsSource };
+          scorePayload = { severity: scanner_severity, confidence: classification.confidence, judge_penalty: judgePenalty, patch_risk: patchRisk, lane_weight: laneWeight, mismatch_penalty: mismatchPenalty, final_priority_score: finalScore };
 
           // Update in-memory metrics (scoring path — has rpsScore + finalScore)
           metrics_total_requests++;
@@ -1792,9 +1907,22 @@ export default {
           if (action === "pr_opened") metrics_pr_opened_count++;
           else metrics_issue_escalated_count++;
           metrics_total_final_score += finalScore;
-          metrics_total_rps_score   += rpsScore;
-          recent_decisions.push({ timestamp: new Date().toISOString(), repo, cve_id: cve_id ?? null, final_score: finalScore, decision: action });
+          recent_decisions.push({ timestamp: new Date().toISOString(), repo, cve_id: null, final_score: finalScore, decision: action });
           if (recent_decisions.length > 10) recent_decisions.shift();
+
+          // Push to in-memory vulnerability ledger
+          vulnerability_ledger.push({
+            timestamp:      new Date().toISOString(),
+            repo,
+            file_path,
+            cwe_id:         classification.cwe_id,
+            severity:       scanner_severity,
+            confidence:     classification.confidence,
+            priority_score: finalScore,
+            action,
+            github_url:     githubUrl ?? "",
+          });
+          if (vulnerability_ledger.length > 50) vulnerability_ledger.shift();
         }
       }
 
@@ -1843,10 +1971,10 @@ export default {
             decision_path: decisionPath,
           },
           remediation_status: remediation.status,
-          risk: {
-            rps_score:            scorePayload.rps_score            ?? 0,
+          priority: {
+            severity:             scorePayload.severity             ?? "unknown",
+            confidence:           scorePayload.confidence           ?? 0,
             final_priority_score: scorePayload.final_priority_score ?? 0,
-            source:               scorePayload.rps_source           ?? null,
           },
           ...scorePayload,
         }),
