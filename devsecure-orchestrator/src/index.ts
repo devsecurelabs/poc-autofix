@@ -65,8 +65,10 @@ interface HiddenSignalLayer {
 
 interface RemediationResult {
   status: "fixed" | "cannot_fix";
-  search_replace_block?: string; // raw <<<< SEARCH / ==== / >>>> REPLACE text
-  reason?: string;
+  fixed_code?: string;           // V2: full fixed file content
+  explanation?: string;          // V2: explanation of the fix
+  search_replace_block?: string; // legacy: kept for fallback path only
+  reason?: string;               // legacy: cannot_fix reason
 }
 
 // Failure classification — determines advisory tone and structured log field.
@@ -122,16 +124,24 @@ async function classify(
   env: Env,
 ): Promise<ClassificationResult> {
   const system = `You are a senior application security engineer specialising in static analysis.
-Return ONLY valid JSON. No markdown, no explanation.
+Return EXACTLY ONE valid JSON object. No markdown, no explanation, no extra text.
+
+CRITICAL OUTPUT RULES:
+- Output starts with { and ends with }
+- No text before or after the JSON object
+- No markdown code fences (no \`\`\`json or \`\`\`)
+- If multiple vulnerabilities exist, return the MOST SEVERE one only — never an array
+
 Schema:
 {
-  "cwe_id": "string",
+  "cwe_id": "string (e.g. CWE-89)",
   "cwe_name": "string",
-  "confidence": number (0-1),
-  "lane": number (1-4),
+  "confidence": number (0.0 to 1.0),
+  "lane": number (1, 2, 3, or 4),
   "summary": "string"
 }
-If you cannot classify, return EXACTLY:
+
+If classification is not possible, return EXACTLY:
 {
   "cwe_id": "UNKNOWN",
   "cwe_name": "Unknown",
@@ -156,17 +166,22 @@ Lane assignment guide:
     512,
   );
 
-  // Extract JSON payload: regex greedily captures from first '{' to last '}'
-  // stripping any surrounding markdown, prose, or code-fence wrapping.
-  const match     = raw.match(/\{[\s\S]*\}/);
-  const cleanText = match ? match[0] : raw;
-
-  if (!match) {
-    console.error(JSON.stringify({ event: "classify_no_json", raw_output: raw.slice(0, 500) }));
-  }
+  // Strip markdown code-fences that chat-tuned models inject around JSON output.
+  // Handles ```json ... ```, ``` ... ```, and bare prose before/after the payload.
+  let cleanText = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
 
   try {
-    return JSON.parse(cleanText) as ClassificationResult;
+    let parsed = JSON.parse(cleanText);
+    // Safeguard: if the model still returned an array despite the prompt, take the first element
+    if (Array.isArray(parsed)) {
+      console.log(JSON.stringify({ event: "classify_array_fallback", array_length: parsed.length }));
+      parsed = parsed[0];
+    }
+    // Schema validator — reject objects missing required fields before they propagate
+    if (!parsed.cwe_id || typeof parsed.confidence !== "number") {
+      throw new Error("Schema validation failed: missing cwe_id or confidence");
+    }
+    return parsed as ClassificationResult;
   } catch (parseErr) {
     console.error(JSON.stringify({
       event:       "classify_json_parse_failed",
@@ -230,46 +245,24 @@ async function remediate(
 
 Your task: produce the minimal security fix — only change what is required to eliminate the vulnerability.
 
-CRITICAL OUTPUT RULES:
-- Return ONLY valid JSON — no prose, no markdown fences, no explanation outside the JSON
-- NEVER output the full file or any unmodified code
-- Express the fix as a SINGLE search/replace block in the "search_replace_block" field
-- The block MUST use this EXACT format (delimiters on their own lines):
+Return ONLY valid JSON. Do not wrap the JSON in markdown blocks. No prose, no explanation outside the JSON.
+Schema:
+{
+  "fixed_code": "string (the full fixed file code)",
+  "explanation": "string (one sentence describing the fix applied)"
+}
 
-<<<< SEARCH
-[exact original lines — must match the file character-for-character, including indentation and blank lines]
-====
-[new secured lines — only the minimal change to eliminate the vulnerability]
->>>> REPLACE
-
-If you can fix the vulnerability with confidence ≥ 0.75:
-{"status":"fixed","search_replace_block":"<<<< SEARCH\\n[exact original]\\n====\\n[fixed lines]\\n>>>> REPLACE"}
-
-Otherwise (low confidence, architectural issue, or insufficient context):
-{"status":"cannot_fix","reason":"<concise explanation for the L4 human reviewer>"}
+If you cannot fix the vulnerability (low confidence, architectural issue, or insufficient context):
+{
+  "fixed_code": "",
+  "explanation": "string (reason why a fix cannot be safely generated)"
+}
 
 Hard constraints:
-- Do NOT output more than one search/replace block
-- The SEARCH text MUST exactly match the existing source — character for character, including whitespace
-- Your <<<< SEARCH block MUST include at least 2 lines of surrounding context (lines before and after the vulnerability) to ensure exact matching during the replacement phase
-- Ensure all newlines within the search_replace_block string are properly escaped as \\n so the JSON remains valid
 - Do NOT alter program behaviour beyond the security fix
 - Do NOT add features, refactor unrelated code, or change formatting
 - Preserve all original comments, variable names, and indentation
-
-CRITICAL — Anti-Duplication Rule:
-- When modifying a variable that is immediately used in an execution statement (e.g., parameterizing a SQL query assigned to a variable and then passed to cursor.execute), your <<<< SEARCH block MUST include BOTH the original variable assignment AND the execution statement that uses it.
-- If you include only the variable assignment in your SEARCH block but add a new execution statement in your REPLACE block, the original execution statement will remain untouched in the file, producing a duplicate execution bug that runs the query twice with inconsistent arguments.
-- Always capture the full logical block being modified. If changing a query string, your SEARCH block must span from the string assignment through to the line where it is executed.
-
-SECURITY AUDIT TRAIL:
-- Your REPLACE block MUST begin with the following formal audit header using the correct comment syntax for the target language, before any code lines:
-  [SECURITY REMEDIATION]
-  TYPE: {CWE_ID}
-  TIMESTAMP: {ISO_DATE}
-  BY: DevSecure Autonomous Surgeon (L3-32B)
-- Use // for JavaScript/TypeScript/Java/C#/Dart, # for Python/Ruby/PHP, -- for SQL.
-- Place this header immediately above the first changed line in your REPLACE block.`;
+- Return the complete file in fixed_code — not a diff, not a partial snippet`;
 
   const user = `## Vulnerability Classification (from Qwen2.5)
 \`\`\`json
@@ -292,65 +285,30 @@ ${code}
     2048,
   );
 
-  const match = raw.match(/\{[\s\S]*\}/);
-  if (!match) {
-    console.error("RAW LLM OUTPUT:", raw);
-    throw new Error(`Remediation model did not return JSON. Raw output: ${raw}`);
-  }
+  // Strip markdown code-fences, extract the JSON object, then parse.
+  let cleanL3 = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
+  const matchL3 = cleanL3.match(/\{[\s\S]*\}/);
+  const finalL3Text = matchL3 ? matchL3[0] : cleanL3;
 
-  // ── Primary path: strict JSON.parse ──────────────────────────────────────
-  let result: RemediationResult;
   try {
-    result = JSON.parse(match[0]) as RemediationResult;
-    return result;
-  } catch (e) {
-    const parseErr = e instanceof Error ? e.message : String(e);
-    console.error(`Remediation JSON parse failed (${parseErr}) — attempting raw-text fallback`);
+    const parsed = JSON.parse(finalL3Text) as { fixed_code?: string; explanation?: string };
+
+    // Map to RemediationResult: empty/missing fixed_code → cannot_fix
+    if (!parsed.fixed_code || parsed.fixed_code.trim() === "") {
+      return {
+        status: "cannot_fix",
+        reason: parsed.explanation ?? "L3 model returned empty fixed_code — cannot safely generate a patch.",
+      };
+    }
+    return {
+      status:      "fixed",
+      fixed_code:  parsed.fixed_code,
+      explanation: parsed.explanation ?? "",
+    };
+  } catch (error) {
+    console.error("L3 Parse Error:", error, "Raw Output:", raw);
+    throw new Error(`L3 Surgeon JSON parse failed: ${error instanceof Error ? error.message : String(error)}`);
   }
-
-  // ── Fallback: raw-text regex extraction ──────────────────────────────────
-  // The 32B model sometimes emits unescaped newlines inside the JSON string
-  // literal for search_replace_block, producing "Bad control character" errors.
-  // Rather than failing, we extract the status and the block directly from the
-  // raw LLM output, making the patch text the source of truth instead of the
-  // JSON envelope.
-
-  const statusMatch = raw.match(/"status"\s*:\s*"(fixed|cannot_fix)"/);
-  if (!statusMatch) {
-    console.error("RAW LLM OUTPUT:", raw);
-    throw new Error("Remediation JSON parse failed and raw-text fallback could not extract status");
-  }
-  const status = statusMatch[1] as "fixed" | "cannot_fix";
-
-  if (status === "cannot_fix") {
-    // Extract reason if present; safe to return without a block
-    const reasonMatch = raw.match(/"reason"\s*:\s*"([^"]+)"/);
-    console.log("Raw-text fallback: cannot_fix extracted");
-    return { status: "cannot_fix", reason: reasonMatch?.[1] ?? "Model returned cannot_fix (raw-text fallback)" };
-  }
-
-  // status === "fixed" — extract the search/replace block directly from raw text.
-  // No JSON.parse: the 32B model mixes unescaped and escaped quotes, making any
-  // JSON token reconstruction unreliable. The raw block is the source of truth.
-  const blockMatch = raw.match(/(<<<< SEARCH[\s\S]*?>>>> REPLACE)/);
-  if (!blockMatch) {
-    console.error("RAW LLM OUTPUT:", raw);
-    throw new Error("Remediation JSON parse failed and raw-text fallback could not extract search/replace block");
-  }
-
-  // Undo JSON escape sequences the model emitted inside the string value.
-  // No JSON.parse — the mixed-quote environment makes token reconstruction unsafe.
-  // Order is critical: double-backslashes must be resolved first so that \\n is
-  // not mistakenly converted to a real newline before \\\\ is collapsed.
-  const decodedBlock = blockMatch[1]
-    .replace(/\\\\/g, "\\")   // \\\\ → \   (collapse double-backslashes first)
-    .replace(/\\"/g, '"')      // \\"  → "   (unescape escaped quotes)
-    .replace(/\\n/g, "\n")     // \n   → LF  (literal backslash-n → real newline)
-    .replace(/\\r/g, "\r")     // \r   → CR
-    .replace(/\\t/g, "\t");    // \t   → TAB
-
-  console.log(JSON.stringify({ event: "remediation_fallback_used", block_length: decodedBlock.length }));
-  return { status: "fixed", search_replace_block: decodedBlock };
 }
 
 // ---------------------------------------------------------------------------
@@ -365,8 +323,10 @@ function validateRemediation(result: RemediationResult): void {
     throw new Error(`Invalid remediation: unknown status "${result.status}"`);
   }
   if (result.status === "fixed") {
-    if (!result.search_replace_block || result.search_replace_block.trim() === "") {
-      throw new Error("Invalid remediation: search_replace_block is missing or empty");
+    const hasFixedCode = result.fixed_code && result.fixed_code.trim() !== "";
+    const hasBlock     = result.search_replace_block && result.search_replace_block.trim() !== "";
+    if (!hasFixedCode && !hasBlock) {
+      throw new Error("Invalid remediation: fixed_code (or legacy search_replace_block) is missing or empty");
     }
   }
   if (result.status === "cannot_fix") {
@@ -756,6 +716,7 @@ const SEVERITY_WEIGHTS: Record<string, number> = {
   high:     80,
   medium:   50,
   low:      20,
+  unknown:  80,  // fail-safe — treat unclassified severity as high to prevent zero-score math errors
 };
 
 // Compute the final priority score from L1 severity and L2 LLM confidence,
@@ -1247,9 +1208,8 @@ let metrics_mismatch_count        = 0;
 interface RecentDecision {
   timestamp: string;
   repo: string;
-  cve_id: string | null;
   final_score: number;
-  decision: "pr_opened" | "issue_escalated";
+  decision: "pr_opened" | "pr_ready" | "issue_escalated";
 }
 const recent_decisions: RecentDecision[] = [];
 
@@ -1684,8 +1644,9 @@ export default {
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
-      if (remediation.status === "fixed" && remediation.search_replace_block) {
-        console.log(JSON.stringify({ event: "remediation_received", status: "fixed", block_length: remediation.search_replace_block.length }));
+      if (remediation.status === "fixed") {
+        const patchLen = (remediation.fixed_code ?? remediation.search_replace_block ?? "").length;
+        console.log(JSON.stringify({ event: "remediation_received", status: "fixed", patch_length: patchLen }));
       } else {
         console.log("Remediation status: " + remediation.status + " — reason: " + (remediation.reason ?? "none"));
       }
@@ -1693,7 +1654,7 @@ export default {
       // ── Step 5: Fail-closed gate + Patch Guard ────────────────────────────
       pipelineStep = "github";
       let githubUrl: string;
-      let action: "pr_opened" | "issue_escalated";
+      let action: "pr_opened" | "pr_ready" | "issue_escalated";
       let judgeWasRun = false;
       let scorePayload: {
         severity: string;
@@ -1718,14 +1679,18 @@ export default {
         );
         action = "issue_escalated";
       } else {
-        // ── Apply search/replace patch (failure_type: model) ─────────────────
+        // ── Apply patch: fixed_code (V2) or search/replace fallback (legacy) ─
         let decoded: string;
         try {
-          decoded = applySearchReplace(code, remediation.search_replace_block!);
+          if (remediation.fixed_code && remediation.fixed_code.trim() !== "") {
+            decoded = remediation.fixed_code;
+          } else {
+            decoded = applySearchReplace(code, remediation.search_replace_block!);
+          }
           decoded = prependAuditHeader(decoded, language, classification.cwe_id);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          const reason = "Malformed search/replace block or context mismatch";
+          const reason = "L3 patch application failed";
           console.error(JSON.stringify({ event: "failure_classified", failure_type: "model", reason, detail: msg, cwe_id: classification.cwe_id, lane: classification.lane, fix_attempted: true, fix_generated: false }));
           githubUrl = await openIssue(
             repo,
@@ -1863,9 +1828,6 @@ export default {
             }));
           }
 
-          // ── Step 5c: RPS / Pseudo-RPS ────────────────────────────────────
-          // cve_id is consumed here and never forwarded to GitHub artifacts
-          // (taxonomy moat — see openIssue / openPr: neither embeds cve_id).
           // ── Step 5d: Final Priority Scoring (V2.0 — Severity × Confidence) ─
           pipelineStep = "scoring";
           const laneWeightMap: Record<number, number> = { 1: 0, 2: 5, 3: 10, 4: 20 };
@@ -1911,9 +1873,11 @@ export default {
           }));
 
           // ── Step 5e: Decision engine ──────────────────────────────────────
+          // Routing is driven by remediation_status, not score thresholds.
+          // Scores are still computed for observability but NEVER gate PR creation.
           pipelineStep = "github";
 
-          // Fail-closed: judge failure or reject always escalates, score is irrelevant
+          // Fail-closed: judge failure or reject always escalates — score irrelevant
           if (judgeFailure || judgeRejectReason !== null) {
             githubUrl = await openIssue(
               repo, file_path, classification,
@@ -1923,28 +1887,13 @@ export default {
               judgeFailure ? "infra" : "policy",
             );
             action = "issue_escalated";
-          } else if (finalScore >= 85) {
-            const complexity = analyseComplexity(file_path);
-            console.log(JSON.stringify({ event: "complexity_analysis", tier: complexity.tier, ccn: complexity.ccn, fan_in: complexity.fan_in, taint_risk: complexity.taint_risk, action: complexity.action, file_path }));
-            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT, scanner_severity, finalScore, complexity);
-            action = "pr_opened";
-            console.log(JSON.stringify({ event: "pr_created", cwe_id: classification.cwe_id, lane: classification.lane, final_score: finalScore, severity: scanner_severity, tier: complexity.tier, pr_label: complexity.pr_label, fix_attempted: true, fix_generated: true }));
-          } else if (finalScore >= 70) {
-            console.log(JSON.stringify({ event: "final_scoring", warning: "score_in_caution_band", final_score: finalScore }));
-            const complexity = analyseComplexity(file_path);
-            console.log(JSON.stringify({ event: "complexity_analysis", tier: complexity.tier, ccn: complexity.ccn, fan_in: complexity.fan_in, taint_risk: complexity.taint_risk, action: complexity.action, file_path }));
-            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT, scanner_severity, finalScore, complexity);
-            action = "pr_opened";
-            console.log(JSON.stringify({ event: "pr_created", cwe_id: classification.cwe_id, lane: classification.lane, final_score: finalScore, severity: scanner_severity, tier: complexity.tier, pr_label: complexity.pr_label, fix_attempted: true, fix_generated: true }));
           } else {
-            githubUrl = await openIssue(
-              repo, file_path, classification,
-              { status: "cannot_fix", reason: `Final priority score too low to auto-merge: score=${finalScore} (severity=${scanner_severity}, confidence=${classification.confidence.toFixed(2)}, judgePenalty=${judgePenalty}, patchRisk=${patchRisk}, laneWeight=${laneWeight}, mismatchPenalty=${mismatchPenalty})` },
-              env.GITHUB_PAT,
-              env,
-              "policy",
-            );
-            action = "issue_escalated";
+            // Remediation succeeded — tier derived from file_path; score does NOT gate this path
+            const complexity = analyseComplexity(file_path);
+            console.log(JSON.stringify({ event: "complexity_analysis", tier: complexity.tier, ccn: complexity.ccn, fan_in: complexity.fan_in, taint_risk: complexity.taint_risk, action: complexity.action, file_path }));
+            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT, scanner_severity, finalScore, complexity);
+            action = "pr_ready";
+            console.log(JSON.stringify({ event: "pr_created", cwe_id: classification.cwe_id, lane: classification.lane, final_score: finalScore, severity: scanner_severity, tier: complexity.tier, pr_label: complexity.pr_label, fix_attempted: true, fix_generated: true }));
           }
 
           scorePayload = { severity: scanner_severity, confidence: classification.confidence, judge_penalty: judgePenalty, patch_risk: patchRisk, lane_weight: laneWeight, mismatch_penalty: mismatchPenalty, final_priority_score: finalScore };
@@ -1952,10 +1901,10 @@ export default {
           // Update in-memory metrics (scoring path — has rpsScore + finalScore)
           metrics_total_requests++;
           if (cwe_mismatch) metrics_mismatch_count++;
-          if (action === "pr_opened") metrics_pr_opened_count++;
+          if (action === "pr_opened" || action === "pr_ready") metrics_pr_opened_count++;
           else metrics_issue_escalated_count++;
           metrics_total_final_score += finalScore;
-          recent_decisions.push({ timestamp: new Date().toISOString(), repo, cve_id: null, final_score: finalScore, decision: action });
+          recent_decisions.push({ timestamp: new Date().toISOString(), repo, final_score: finalScore, decision: action });
           if (recent_decisions.length > 10) recent_decisions.shift();
 
           // Push to in-memory vulnerability ledger
@@ -1978,9 +1927,9 @@ export default {
       if (Object.keys(scorePayload).length === 0 && action !== undefined) {
         metrics_total_requests++;
         if (cwe_mismatch) metrics_mismatch_count++;
-        if (action === "pr_opened") metrics_pr_opened_count++;
+        if (action === "pr_opened" || action === "pr_ready") metrics_pr_opened_count++;
         else metrics_issue_escalated_count++;
-        recent_decisions.push({ timestamp: new Date().toISOString(), repo, cve_id: cve_id ?? null, final_score: 0, decision: action });
+        recent_decisions.push({ timestamp: new Date().toISOString(), repo, final_score: 0, decision: action });
         if (recent_decisions.length > 10) recent_decisions.shift();
       }
 
@@ -2006,7 +1955,6 @@ export default {
             confidence: classification.confidence,
           },
           correlation: {
-            cve_id: cve_id ?? null,
             cwe_mismatch,
           },
           metrics: {

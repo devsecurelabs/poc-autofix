@@ -26,12 +26,12 @@ def login():
         return "Invalid credentials"
 
 
-# --- Command Injection Vulnerability ---  
+# --- Command Injection Vulnerability ---     
 @app.route('/ping', methods=['GET'])
 def ping():
     ip = request.args.get('ip')
 
-    # ❌ Directly passing user input into shell
+    # ❌ Directly passing user input into shell    
     result = os.popen(f"ping -c 1 {ip}").read()
 
     return f"<pre>{result}</pre>"
