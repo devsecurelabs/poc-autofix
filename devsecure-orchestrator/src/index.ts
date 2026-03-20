@@ -1567,13 +1567,11 @@ export default {
         classification.cwe_id === "CWE-0" ||
         classification.cwe_id === "UNKNOWN";
       const confidenceBlocked = (classification.confidence ?? 0) < 0.75;
-      const laneBlocked = (classification.lane ?? 4) >= 3;
       const summaryBlocked = BENIGN_PATTERNS.some((p) => summaryLower.includes(p));
-      if (confidenceBlocked || laneBlocked || cweBlocked || summaryBlocked) {
+      if (confidenceBlocked || cweBlocked || summaryBlocked) {
         console.log("Blocked by confidence gate:", JSON.stringify(classification));
         const gateReason = [
           confidenceBlocked && `confidence=${classification.confidence} < 0.75`,
-          laneBlocked && `lane=${classification.lane} >= 3`,
           cweBlocked && `cwe_id invalid ("${classification.cwe_id}")`,
           summaryBlocked && `summary matched benign pattern`,
         ].filter(Boolean).join("; ");
