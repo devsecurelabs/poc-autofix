@@ -1654,15 +1654,17 @@ export default {
       let githubUrl: string;
       let action: "pr_opened" | "pr_ready" | "issue_escalated";
       let judgeWasRun = false;
-      let scorePayload: {
-        severity: string;
-        confidence: number;
-        judge_penalty: number;
-        patch_risk: number;
-        lane_weight: number;
-        mismatch_penalty: number;
-        final_priority_score: number;
-      } | Record<string, never> = {};
+      // Pre-populated with safe defaults so downstream reads never see undefined/0 from
+      // a missing scoring pass (e.g. remediation.status === "cannot_fix" early exit).
+      let scorePayload = {
+        severity:             "high",
+        confidence:           classification.confidence,
+        judge_penalty:        0,
+        patch_risk:           0,
+        lane_weight:          0,
+        mismatch_penalty:     0,
+        final_priority_score: 0,
+      };
 
       if (remediation.status === "cannot_fix") {
         // L4 escalation path → open GitHub Issue
@@ -1850,8 +1852,14 @@ export default {
             else                   mismatchPenalty = 15;
           }
 
+          // Fail-closed severity normalisation — unknown/missing defaults to 'high' so base
+          // score is never 0 due to a missing L1 scanner field.
+          const severity = (!scanner_severity || scanner_severity.toLowerCase() === "unknown")
+            ? "high"
+            : scanner_severity.toLowerCase();
+
           const finalScore = computePriorityScore(
-            scanner_severity,
+            severity,
             classification.confidence,
             judgePenalty,
             patchRisk,
@@ -1861,7 +1869,7 @@ export default {
 
           console.log(JSON.stringify({
             event:            "final_scoring",
-            severity:         scanner_severity,
+            severity,
             confidence:       classification.confidence,
             judge_penalty:    judgePenalty,
             lane_weight:      laneWeight,
@@ -1871,9 +1879,12 @@ export default {
           }));
 
           // ── Step 5e: Decision engine ──────────────────────────────────────
-          // Routing is driven by remediation_status, not score thresholds.
-          // Scores are still computed for observability but NEVER gate PR creation.
           pipelineStep = "github";
+
+          // Safety assertion — a zero score after defensive normalisation is a pipeline bug
+          if (finalScore === 0) {
+            console.error("⚠️ SCORING BUG: score is 0", { class_conf: classification.confidence, scorePayload });
+          }
 
           // Fail-closed: judge failure or reject always escalates — score irrelevant
           if (judgeFailure || judgeRejectReason !== null) {
@@ -1885,16 +1896,27 @@ export default {
               judgeFailure ? "infra" : "policy",
             );
             action = "issue_escalated";
-          } else {
-            // Remediation succeeded — tier derived from file_path; score does NOT gate this path
+          } else if (finalScore >= 70) {
+            // Remediation succeeded + score meets threshold — open PR, tier from file_path
             const complexity = analyseComplexity(file_path);
             console.log(JSON.stringify({ event: "complexity_analysis", tier: complexity.tier, ccn: complexity.ccn, fan_in: complexity.fan_in, taint_risk: complexity.taint_risk, action: complexity.action, file_path }));
-            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT, scanner_severity, finalScore, complexity);
+            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT, severity, finalScore, complexity);
             action = "pr_ready";
-            console.log(JSON.stringify({ event: "pr_created", cwe_id: classification.cwe_id, lane: classification.lane, final_score: finalScore, severity: scanner_severity, tier: complexity.tier, pr_label: complexity.pr_label, fix_attempted: true, fix_generated: true }));
+            console.log(JSON.stringify({ event: "pr_created", cwe_id: classification.cwe_id, lane: classification.lane, final_score: finalScore, severity, tier: complexity.tier, pr_label: complexity.pr_label, fix_attempted: true, fix_generated: true }));
+          } else {
+            // Remediation succeeded but score below threshold — escalate with diagnostic
+            githubUrl = await openIssue(
+              repo, file_path, classification,
+              { status: "cannot_fix", reason: `Priority score below threshold: ${finalScore}/100 (severity=${severity}, confidence=${classification.confidence.toFixed(2)}, laneWeight=${laneWeight}, patchRisk=${patchRisk}, mismatchPenalty=${mismatchPenalty})` },
+              env.GITHUB_PAT,
+              env,
+              "policy",
+            );
+            action = "issue_escalated";
+            console.log(JSON.stringify({ event: "score_gate_blocked", final_score: finalScore, severity, confidence: classification.confidence }));
           }
 
-          scorePayload = { severity: scanner_severity, confidence: classification.confidence, judge_penalty: judgePenalty, patch_risk: patchRisk, lane_weight: laneWeight, mismatch_penalty: mismatchPenalty, final_priority_score: finalScore };
+          scorePayload = { severity, confidence: classification.confidence, judge_penalty: judgePenalty, patch_risk: patchRisk, lane_weight: laneWeight, mismatch_penalty: mismatchPenalty, final_priority_score: finalScore };
 
           // Update in-memory metrics (scoring path — has rpsScore + finalScore)
           metrics_total_requests++;
@@ -1967,7 +1989,7 @@ export default {
           remediation_status: remediation.status,
           priority: {
             severity:             scorePayload.severity             ?? "unknown",
-            confidence:           scorePayload.confidence           ?? 0,
+            confidence:           scorePayload.confidence           ?? classification.confidence,
             final_priority_score: scorePayload.final_priority_score ?? 0,
           },
           ...scorePayload,
