@@ -1867,6 +1867,19 @@ export default {
             mismatchPenalty,
           );
 
+          // Freeze the scoring payload immediately after calculation — prevents any downstream
+          // reassignment from corrupting the values seen in the response and assertion logs.
+          scorePayload = Object.freeze({
+            severity,
+            confidence:           classification.confidence,
+            judge_penalty:        judgePenalty    || 0,
+            patch_risk:           patchRisk       || 0,
+            lane_weight:          laneWeight      || 0,
+            mismatch_penalty:     mismatchPenalty || 0,
+            final_priority_score: finalScore,
+          });
+
+          console.log("FINAL SCORE DEBUG:", { severity, confidence: classification.confidence, finalScore });
           console.log(JSON.stringify({
             event:            "final_scoring",
             severity,
@@ -1916,8 +1929,6 @@ export default {
             console.log(JSON.stringify({ event: "score_gate_blocked", final_score: finalScore, severity, confidence: classification.confidence }));
           }
 
-          scorePayload = { severity, confidence: classification.confidence, judge_penalty: judgePenalty, patch_risk: patchRisk, lane_weight: laneWeight, mismatch_penalty: mismatchPenalty, final_priority_score: finalScore };
-
           // Update in-memory metrics (scoring path — has rpsScore + finalScore)
           metrics_total_requests++;
           if (cwe_mismatch) metrics_mismatch_count++;
@@ -1943,8 +1954,11 @@ export default {
         }
       }
 
-      // Update metrics for cannot_fix / patch-guard-blocked paths (no score computed)
-      if (Object.keys(scorePayload).length === 0 && action !== undefined) {
+      // Update metrics for cannot_fix / patch-guard-blocked paths (no score computed).
+      // Guard: only fires when scorePayload was never populated (early-exit paths).
+      // Using action === "issue_escalated" prevents this block from overriding a valid
+      // frozen scorePayload with zeroed metrics on the PR path.
+      if (Object.keys(scorePayload).length === 0 && action === "issue_escalated") {
         metrics_total_requests++;
         if (cwe_mismatch) metrics_mismatch_count++;
         if (action === "pr_opened" || action === "pr_ready") metrics_pr_opened_count++;
@@ -1965,6 +1979,41 @@ export default {
         "score",
         action,
       ].join(" → ");
+
+      // Sanity check — high-confidence detections must never produce a zero final score
+      if (scorePayload.final_priority_score === 0 && scorePayload.confidence > 0.9) {
+        console.error("🚨 SCORING CORRUPTION DETECTED", scorePayload);
+      }
+
+      // --- Board-Approved State Integrity Matrix ---
+      const remediation_status = remediation.status;
+
+      if (!action || !remediation_status) {
+        throw new Error("INVALID_STATE_INPUT: action or remediation_status is undefined");
+      }
+
+      const isHighRisk      = scorePayload.final_priority_score >= 70;
+      const isEscalated     = action === "issue_escalated";
+      const isFixSuccessful = remediation_status === "fixed";
+      const isPRReady       = action === "pr_ready" || action === "pr_opened";
+      const isAutoMerged    = action === "auto_merged";
+
+      // NOTE: isHighRisk && isFixSuccessful && isPRReady is the EXPECTED valid path for Enterprise Manual Review.
+
+      // Violations:
+      // 1. Fixed but escalated → wasted AI effort / bad routing
+      // 2. Not fixed but PR opened → unsafe / hallucinated fix
+      // 3. High-risk auto-merged → critical governance failure
+      const routingViolation =
+        (isFixSuccessful && isEscalated) ||
+        (!isFixSuccessful && isPRReady) ||
+        (isHighRisk && isAutoMerged);
+
+      if (routingViolation) {
+        const errorContext = JSON.stringify({ isHighRisk, isFixSuccessful, action, remediation_status, final_score: scorePayload.final_priority_score });
+        console.error(`🚨 ROUTING INTEGRITY VIOLATION: ${errorContext}`);
+        throw new Error(`ROUTING_INTEGRITY_VIOLATION: ${errorContext}`);
+      }
 
       return new Response(
         JSON.stringify({
