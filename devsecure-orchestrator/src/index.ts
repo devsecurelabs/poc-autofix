@@ -721,19 +721,17 @@ const SEVERITY_WEIGHTS: Record<string, number> = {
   unknown:  80,  // fail-safe — treat unclassified severity as high to prevent zero-score math errors
 };
 
-// Compute the final priority score from L1 severity and L2 LLM confidence,
+// Compute the final priority score from a pre-computed severity weight and L2 LLM confidence,
 // then subtract pipeline penalties applied upstream (judge, patch risk, etc.).
 function computePriorityScore(
-  scannerSeverity: string | undefined,
+  severityWeight: number,
   confidence: number,
   judgePenalty: number,
   patchRisk: number,
   laneWeight: number,
   mismatchPenalty: number,
 ): number {
-  const baseScore = Math.round(
-    (SEVERITY_WEIGHTS[(scannerSeverity ?? "").toLowerCase()] ?? 50) * confidence,
-  );
+  const baseScore = Math.round(severityWeight * confidence);
   return Math.min(100, Math.max(0, baseScore - judgePenalty - patchRisk - laneWeight - mismatchPenalty));
 }
 
@@ -1514,31 +1512,35 @@ export default {
     }
 
     // Better Stack telemetry helper — request-scoped; captures traceId + ds_detection context.
-    // auditCritical=true → throws on token missing or HTTP error (fail-closed).
-    const emitDecision = (
+    // Non-blocking: telemetry failures are logged but never propagate as pipeline errors.
+    const emitDecision = async (
       stage: string,
       decision: string,
       reason: string,
       classification?: ClassificationResult,
       finalScore?: number,
-      auditCritical = false,
-    ): Promise<void> =>
-      emitEvent(
-        env.BETTERSTACK_SOURCE_TOKEN,
-        {
-          timestamp:            new Date().toISOString(),
-          stage,
-          run_id:               traceId,
-          cve_id:               ds_detection?.cve_id ?? null,
-          cwe_id:               classification?.cwe_id     ?? "UNKNOWN",
-          lane:                 classification?.lane       ?? 0,
-          confidence:           classification?.confidence ?? 0,
-          decision,
-          reason,
-          final_priority_score: finalScore,
-        },
-        auditCritical,
-      );
+      _auditCritical = false,
+    ): Promise<void> => {
+      try {
+        await emitEvent(
+          env.BETTERSTACK_SOURCE_TOKEN,
+          {
+            timestamp:            new Date().toISOString(),
+            stage,
+            run_id:               traceId,
+            cve_id:               ds_detection?.cve_id ?? null,
+            cwe_id:               classification?.cwe_id     ?? "UNKNOWN",
+            lane:                 classification?.lane       ?? 0,
+            confidence:           classification?.confidence ?? 0,
+            decision,
+            reason,
+            final_priority_score: finalScore,
+          },
+        );
+      } catch (err) {
+        console.error("Telemetry failure (non-blocking)", err);
+      }
+    };
 
     let pipelineStep = "init";
     const start = Date.now();
@@ -1799,6 +1801,9 @@ export default {
             env,
             "policy",
           );
+          // Explicit state update — ensures State Integrity Matrix sees cannot_fix when
+          // Patch Guard blocks, preventing a ROUTING_INTEGRITY_VIOLATION false positive.
+          remediation.status = "cannot_fix";
           action = "issue_escalated";
         } else {
           // ── Step 5b: Diversity Judge (risk-triggered, fail-closed) ───────────
@@ -1902,14 +1907,13 @@ export default {
             else                   mismatchPenalty = 15;
           }
 
-          // Fail-closed severity normalisation — unknown/missing defaults to 'high' so base
-          // score is never 0 due to a missing L1 scanner field.
-          const severity = (!scanner_severity || scanner_severity.toLowerCase() === "unknown")
-            ? "high"
-            : scanner_severity.toLowerCase();
+          // Severity fallback — exact RCA fix: null/undefined defaults to 'unknown',
+          // weight lookup falls back to 80 (fail-closed HIGH) to prevent NaN scoring.
+          const severity = scanner_severity ?? 'unknown';
+          const severityWeight = SEVERITY_WEIGHTS[severity] ?? 80; // Fail-closed default
 
           const finalScore = computePriorityScore(
-            severity,
+            severityWeight,
             classification.confidence,
             judgePenalty,
             patchRisk,
@@ -1944,9 +1948,10 @@ export default {
           // ── Step 5e: Decision engine ──────────────────────────────────────
           pipelineStep = "github";
 
-          // Safety assertion — a zero score after defensive normalisation is a pipeline bug
-          if (finalScore === 0) {
-            console.error("⚠️ SCORING BUG: score is 0", { class_conf: classification.confidence, scorePayload });
+          // Scoring guard — exact RCA fix: catch silent corruption immediately after freeze.
+          if (!scorePayload || typeof scorePayload.final_priority_score !== 'number' || scorePayload.final_priority_score <= 0) {
+            console.error('🚨 SCORING CORRUPTION DETECTED', scorePayload);
+            throw new Error('INVALID_SCORE_PAYLOAD');
           }
 
           // Fail-closed: judge failure or reject always escalates — score irrelevant

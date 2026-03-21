@@ -11,7 +11,7 @@ def get_user():
     username = request.args.get('username')
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
-    # DANGER: String concatenation in SQL
+    # DANGER: String concatenation in SQL  
     query = "SELECT * FROM users WHERE username = '" + username + "'"
     cursor.execute(query)
     return str(cursor.fetchall())
