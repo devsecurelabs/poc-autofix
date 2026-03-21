@@ -5,7 +5,7 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-# VULNERABILITY 1: SQL Injection
+# VULNERABILITY 1: SQL Injection 
 @app.route("/get-user")
 def get_user():
     username = request.args.get('username')
