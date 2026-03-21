@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npx wrangler:*)"
+      "Bash(npx wrangler:*)",
+      "Bash(powershell -Command \"\n\\\\$bytes = [System.IO.File]::ReadAllBytes\\('C:\\\\Users\\\\jerem\\\\script\\\\quadriconsulting\\\\poc-autofix\\\\README.md'\\)\nWrite-Host \\('First 4 bytes: ' + \\(\\\\$bytes[0..3] -join ', '\\)\\)\nWrite-Host \\('File size: ' + \\\\$bytes.Length + ' bytes'\\)\n[System.Text.Encoding]::UTF8.GetString\\(\\\\$bytes[0..199]\\)\n\")"
     ]
   }
 }

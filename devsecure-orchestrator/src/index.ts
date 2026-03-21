@@ -6,6 +6,7 @@
 import { getEmbedding } from "./embed";
 import { seedCWEData } from "./seed-data";
 import type { Env } from "./env";
+import { emitEvent } from "./telemetry";
 
 // HF Inference Router — primary 2026 endpoint; model dispatched via body "model" field
 const HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions";
@@ -24,6 +25,7 @@ interface DsDetection {
   type: string;               // detection rule type
   rule_id: string;            // unique rule identifier
   cwe_hint?: string;          // used for mismatch detection — never the final CWE
+  cve_id?: string;            // CVE identifier — optional enrichment for dependency vulns
   scanner_severity?: string;  // L1 scanner severity — V2.0 primary priority signal
                               // ("critical" | "high" | "medium" | "low")
 
@@ -1236,11 +1238,28 @@ const vulnerability_ledger: LedgerEntry[] = [];
 // ---------------------------------------------------------------------------
 
 export default {
-  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // Health check
     if (request.method === "GET" && url.pathname === "/") {
+      // TEMPORARY PROBE — remove after Better Stack Live Tail delivery is confirmed.
+      // Fires a single test event on every GET / so you can verify end-to-end ingestion
+      // without triggering the remediation pipeline.
+      // To test: curl https://devsecure-orchestrator.quadri-jay.workers.dev/ then watch Live Tail.
+      ctx.waitUntil(emitEvent(env.BETTERSTACK_SOURCE_TOKEN, {
+        timestamp:            new Date().toISOString(),
+        stage:                "probe",
+        run_id:               request.headers.get("CF-Ray") ?? request.headers.get("X-Trace-Id") ?? crypto.randomUUID(),
+        cve_id:               null,
+        cwe_id:               null,
+        lane:                 null,
+        confidence:           null,
+        decision:             "probe",
+        reason:               "manual connectivity test",
+        final_priority_score: null,
+        message:              "probe event from devsecure-orchestrator",
+      }));
       return new Response(
         JSON.stringify({ status: "ok", service: "devsecure-orchestrator" }),
         { status: 200, headers: { "Content-Type": "application/json" } },
@@ -1494,6 +1513,33 @@ export default {
       );
     }
 
+    // Better Stack telemetry helper — request-scoped; captures traceId + ds_detection context.
+    // auditCritical=true → throws on token missing or HTTP error (fail-closed).
+    const emitDecision = (
+      stage: string,
+      decision: string,
+      reason: string,
+      classification?: ClassificationResult,
+      finalScore?: number,
+      auditCritical = false,
+    ): Promise<void> =>
+      emitEvent(
+        env.BETTERSTACK_SOURCE_TOKEN,
+        {
+          timestamp:            new Date().toISOString(),
+          stage,
+          run_id:               traceId,
+          cve_id:               ds_detection?.cve_id ?? null,
+          cwe_id:               classification?.cwe_id     ?? "UNKNOWN",
+          lane:                 classification?.lane       ?? 0,
+          confidence:           classification?.confidence ?? 0,
+          decision,
+          reason,
+          final_priority_score: finalScore,
+        },
+        auditCritical,
+      );
+
     let pipelineStep = "init";
     const start = Date.now();
     try {
@@ -1586,6 +1632,7 @@ export default {
           env,
           "policy",
         );
+        await emitDecision("confidence_gate", "issue_escalated", gateReason, classification);
         console.log("Pipeline duration:", Date.now() - start, "ms");
         return new Response(
           JSON.stringify({
@@ -1631,6 +1678,7 @@ export default {
           env,
           "model",
         );
+        await emitDecision("remediation_retry", "issue_escalated", msg, classification);
         console.log("Pipeline duration:", Date.now() - start, "ms");
         return new Response(
           JSON.stringify({
@@ -1702,6 +1750,7 @@ export default {
             "model",
           );
           action = "issue_escalated";
+          await emitDecision("patch_apply", "issue_escalated", reason, classification);
           console.log("Pipeline duration:", Date.now() - start, "ms");
           return new Response(
             JSON.stringify({ action, github_url: githubUrl, classification, remediation_status: "cannot_fix" }),
@@ -1726,6 +1775,7 @@ export default {
             "infra",
           );
           action = "issue_escalated";
+          await emitDecision("patch_guard_calc", "issue_escalated", `Patch Guard calculation error: ${msg}`, classification);
           console.log("Pipeline duration:", Date.now() - start, "ms");
           return new Response(
             JSON.stringify({ action, github_url: githubUrl, classification, remediation_status: "cannot_fix" }),
@@ -2012,9 +2062,18 @@ export default {
       if (routingViolation) {
         const errorContext = JSON.stringify({ isHighRisk, isFixSuccessful, action, remediation_status, final_score: scorePayload.final_priority_score });
         console.error(`🚨 ROUTING INTEGRITY VIOLATION: ${errorContext}`);
+        await emitDecision("routing_integrity", "violation", errorContext, classification, scorePayload.final_priority_score, true);
         throw new Error(`ROUTING_INTEGRITY_VIOLATION: ${errorContext}`);
       }
 
+      await emitDecision(
+        action === "issue_escalated" ? "decision" : "pr_created",
+        action,
+        explainabilityFactors.join(", ") || "pipeline_complete",
+        classification,
+        scorePayload.final_priority_score,
+        action !== "issue_escalated", // audit-critical for pr_ready / pr_opened
+      );
       return new Response(
         JSON.stringify({
           action,
@@ -2048,6 +2107,7 @@ export default {
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
       console.error(`Pipeline failure at step [${pipelineStep}]:`, detail);
+      await emitDecision("pipeline_failure", "error", `${pipelineStep}: ${detail}`).catch(() => {});
       return new Response(
         JSON.stringify({ error: "Pipeline failure.", step: pipelineStep, detail }),
         { status: 500, headers: { "Content-Type": "application/json" } },

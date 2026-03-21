@@ -13,6 +13,11 @@ REMEDIATION_MODEL = "Qwen/Qwen2.5-Coder-32B-Instruct"
 #   wrangler secret put GITHUB_PAT
 #   wrangler secret put HF_API_KEY
 #   wrangler secret put SEED_SECRET
+#   wrangler secret put BETTERSTACK_SOURCE_TOKEN   # Better Stack Logs ingestion (runtime telemetry)
+# GitHub Actions secrets (CI only — not Worker secrets):
+#   BETTERSTACK_UPTIME_TOKEN   # Better Stack Uptime heartbeat/monitor automation
+#   CLOUDFLARE_API_TOKEN       # wrangler deploy auth
+#   CLOUDFLARE_ACCOUNT_ID      # wrangler deploy account
 
 [ai]
 binding = "AI"

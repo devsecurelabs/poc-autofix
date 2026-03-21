@@ -11,7 +11,10 @@ permissions:
 jobs:
   post-merge-guard:
     name: Post-Merge Guard — Regression Detection & Rollback
-    if: false # Phase 2 — disabled pending Better Stack observability integration
+    # Tier C guard: runs only for automated devsecure fix commits, not manual pushes.
+    if: |
+      startsWith(github.event.head_commit.message, 'fix(security):') ||
+      startsWith(github.event.head_commit.message, 'chore(security):')
     runs-on: ubuntu-latest
 
     steps:
@@ -214,13 +217,65 @@ jobs:
 
           echo "[POST_MERGE_GUARD] Test stage complete."
 
+      # ── Tier C: Better Stack Uptime health gate ─────────────────────────────
+      # Polls Better Stack Uptime API every 30 s for 15 minutes post-merge.
+      # Fails (→ rollback) if any monitor reports `down` or `degraded`.
+      # If BETTERSTACK_UPTIME_TOKEN is absent the step skips with a warning.
+      # API errors are non-fatal: logged and polling continues.
+      - name: Better Stack health gate (15-minute window)
+        if: steps.rollback-check.outputs.skip == 'false'
+        id: health_gate
+        env:
+          BETTERSTACK_UPTIME_TOKEN: ${{ secrets.BETTERSTACK_UPTIME_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BETTERSTACK_UPTIME_TOKEN:-}" ]; then
+            echo "::warning::BETTERSTACK_UPTIME_TOKEN not set — Tier C health gate skipped."
+            exit 0
+          fi
+
+          MERGE_TIME=$(date -u +%s)
+          DEADLINE=$(( MERGE_TIME + 900 ))   # 15-minute window
+          POLL_INTERVAL=30
+
+          echo "[TIER_C] Health gate active. Monitoring for 15 minutes (until $(date -u -d @${DEADLINE} +%H:%M:%SZ 2>/dev/null || date -u -r ${DEADLINE} +%H:%M:%SZ))."
+
+          while [ "$(date -u +%s)" -lt "$DEADLINE" ]; do
+            HTTP_STATUS=$(curl -sf -o /tmp/bs_monitors.json -w "%{http_code}" \
+              -H "Authorization: Bearer $BETTERSTACK_UPTIME_TOKEN" \
+              "https://uptime.betterstack.com/api/v2/monitors" || echo "000")
+
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "::warning::[TIER_C] Better Stack API returned HTTP $HTTP_STATUS — skipping this poll."
+              sleep "$POLL_INTERVAL"
+              continue
+            fi
+
+            DEGRADED=$(jq '[.data[] | select(.attributes.status == "down" or .attributes.status == "degraded")] | length' /tmp/bs_monitors.json)
+
+            if [ "$DEGRADED" -gt "0" ]; then
+              echo "::error::[TIER_C] $DEGRADED monitor(s) degraded or down — triggering rollback."
+              jq -r '.data[] | select(.attributes.status == "down" or .attributes.status == "degraded") | "  [\(.attributes.status | ascii_upcase)] \(.attributes.url // .attributes.pronounceable_name)"' /tmp/bs_monitors.json
+              echo "health_failed=true" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+
+            ELAPSED=$(( $(date -u +%s) - MERGE_TIME ))
+            REMAINING=$(( DEADLINE - $(date -u +%s) ))
+            echo "[TIER_C] All monitors healthy. Elapsed: ${ELAPSED}s | Remaining: ${REMAINING}s"
+            sleep "$POLL_INTERVAL"
+          done
+
+          echo "[TIER_C] 15-minute window passed. No incidents detected."
+
       - name: Rollback on failure
         if: >
           steps.rollback-check.outputs.skip == 'false' &&
           failure() &&
-          (steps.validate.conclusion == 'failure' || steps.tests.conclusion == 'failure')
+          (steps.validate.conclusion == 'failure' || steps.tests.conclusion == 'failure' || steps.health_gate.conclusion == 'failure')
         env:
-          FAIL_REASON: ${{ steps.validate.outputs.fail_reason || steps.tests.outputs.fail_reason || 'unknown validation failure' }}
+          FAIL_REASON: ${{ steps.health_gate.outputs.health_failed == 'true' && 'Better Stack monitor degraded/down within 15 minutes of merge' || steps.validate.outputs.fail_reason || steps.tests.outputs.fail_reason || 'unknown validation failure' }}
         run: |
           set -euo pipefail
 

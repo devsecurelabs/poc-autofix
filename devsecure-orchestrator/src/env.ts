@@ -9,6 +9,7 @@ export interface Env {
   SEED_SECRET: string;  // wrangler secret put SEED_SECRET  — protects GET /seed
   JUDGE_API_KEY: string; // wrangler secret put JUDGE_API_KEY — OpenAI key for diversity judge
   RPS_TOKEN: string;     // wrangler secret put RPS_TOKEN — auth for RPS scoring API
+  BETTERSTACK_SOURCE_TOKEN?: string; // wrangler secret put BETTERSTACK_SOURCE_TOKEN — Better Stack Logs ingestion
   // Optional overrides — set in wrangler.toml [vars] or via environment; fallbacks used if absent
   CLASSIFIER_MODEL?: string;
   REMEDIATION_MODEL?: string;
