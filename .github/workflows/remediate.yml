@@ -153,7 +153,26 @@ jobs:
           fi
 
           for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
-            echo "Processing $file..."
+
+            # Guard: file must exist
+            if [ ! -f "$file" ]; then
+              echo "⚠️ Skipping missing file: $file"
+              continue
+            fi
+
+            # Guard: file must be non-empty
+            if [ ! -s "$file" ]; then
+              echo "⚠️ Skipping empty file: $file"
+              continue
+            fi
+
+            # Guard: restrict to supported source extensions
+            case "$file" in
+              *.py|*.js|*.ts|*.php) ;;
+              *) echo "⚠️ Skipping unsupported file: $file"; continue ;;
+            esac
+
+            echo "📄 Processing file: $file"
 
             filename=$(basename -- "$file")
             extension="${file##*.}"

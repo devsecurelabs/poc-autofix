@@ -2035,11 +2035,6 @@ export default {
         action,
       ].join(" → ");
 
-      // Sanity check — high-confidence detections must never produce a zero final score
-      if (scorePayload.final_priority_score === 0 && scorePayload.confidence > 0.9) {
-        console.error("🚨 SCORING CORRUPTION DETECTED", scorePayload);
-      }
-
       // --- Board-Approved State Integrity Matrix ---
       const remediation_status = remediation.status;
 
