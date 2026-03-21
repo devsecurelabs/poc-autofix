@@ -60,9 +60,8 @@ interface ClassificationResult {
 
 // HiddenSignalLayer — internal only; never serialised to API responses or full logs
 interface HiddenSignalLayer {
-  source_type: string;       // detection origin (e.g. "sast", "dast", "manual")
-  cwe_hint?: string;         // vendor-supplied CWE; used only for mismatch detection
-  scanner_severity?: string; // L1 severity; forwarded to priority scoring
+  source_type: string;   // detection origin (e.g. "sast", "dast", "manual")
+  cwe_hint?: string;     // vendor-supplied CWE; used only for mismatch detection
 }
 
 interface RemediationResult {
@@ -711,28 +710,32 @@ const COMPLEX_CWES = ["CWE-89", "CWE-78", "CWE-22", "CWE-79", "CWE-94"];
 // V2.0 Priority Scoring — L1 Severity × L2 Confidence
 // ---------------------------------------------------------------------------
 
-// Maps L1 scanner severity string to a 0-100 base score.
-// Default 50 when the scanner did not supply a severity value.
-const SEVERITY_WEIGHTS: Record<string, number> = {
-  critical: 100,
-  high:     80,
-  medium:   50,
-  low:      20,
-  unknown:  80,  // fail-safe — treat unclassified severity as high to prevent zero-score math errors
+// CWE-based severity map — Fusion Score core.
+// Scoring is derived purely from vulnerability class, not external detection signals.
+// Fail-closed default: 80 (HIGH) for any unrecognised CWE.
+const CWE_SEVERITY: Record<string, number> = {
+  "CWE-78":  80,  // Command Injection
+  "CWE-89":  80,  // SQL Injection
+  "CWE-79":  70,  // XSS
+  "CWE-22":  75,  // Path Traversal
+  "CWE-94":  80,  // Code Injection
+  "CWE-287": 75,  // Authentication Bypass
+  "CWE-502": 75,  // Deserialization
+  "CWE-611": 70,  // XXE
 };
 
-// Compute the final priority score from a pre-computed severity weight and L2 LLM confidence,
+// Compute the final priority score from CWE-derived severity_base and L2 LLM confidence,
 // then subtract pipeline penalties applied upstream (judge, patch risk, etc.).
 function computePriorityScore(
-  severityWeight: number,
+  severity_base: number,
   confidence: number,
   judgePenalty: number,
   patchRisk: number,
   laneWeight: number,
   mismatchPenalty: number,
 ): number {
-  const baseScore = Math.round(severityWeight * confidence);
-  return Math.min(100, Math.max(0, baseScore - judgePenalty - patchRisk - laneWeight - mismatchPenalty));
+  const base_score = Math.round(severity_base * confidence);
+  return Math.min(100, Math.max(0, base_score - judgePenalty - patchRisk - laneWeight - mismatchPenalty));
 }
 
 // ---------------------------------------------------------------------------
@@ -1446,17 +1449,16 @@ export default {
     const language = code_context?.language ?? body.language;
 
     // Detection Normalisation Layer
-    // scanner_severity → consumed as V2.0 L1 priority signal
-    // scanner_confidence / scanner_cwe → discarded; L2 LLM is sole authoritative source
+    // Detection Normalisation Layer — scanner_confidence / scanner_cwe / scanner_severity discarded.
+    // Fusion Score is derived purely from CWE classification. No external severity signals.
     void ds_detection?.scanner_confidence;
     void ds_detection?.scanner_cwe;
-    const scanner_severity = (ds_detection?.scanner_severity ?? "").toLowerCase() || "unknown";
+    void ds_detection?.scanner_severity;
 
     // ── Hidden Signal Layer — internal context; never exposed in API responses ─
     const hsl: HiddenSignalLayer = {
-      source_type:      ds_detection?.type ?? "unknown",
-      cwe_hint:         ds_detection?.cwe_hint,
-      scanner_severity: scanner_severity,
+      source_type: ds_detection?.type ?? "unknown",
+      cwe_hint:    ds_detection?.cwe_hint,
     };
 
     if (!code || !language) {
@@ -1707,7 +1709,7 @@ export default {
       // Pre-populated with safe defaults so downstream reads never see undefined/0 from
       // a missing scoring pass (e.g. remediation.status === "cannot_fix" early exit).
       let scorePayload = {
-        severity:             "high",
+        severity_base:        CWE_SEVERITY[classification.cwe_id] ?? 80,
         confidence:           classification.confidence,
         judge_penalty:        0,
         patch_risk:           0,
@@ -1907,13 +1909,21 @@ export default {
             else                   mismatchPenalty = 15;
           }
 
-          // Severity fallback — exact RCA fix: null/undefined defaults to 'unknown',
-          // weight lookup falls back to 80 (fail-closed HIGH) to prevent NaN scoring.
-          const severity = scanner_severity ?? 'unknown';
-          const severityWeight = SEVERITY_WEIGHTS[severity] ?? 80; // Fail-closed default
+          // ── Fusion Score: CWE-based severity — no dependency on external detection signals ─
+          const severity_base = CWE_SEVERITY[classification.cwe_id] ?? 80; // fail-closed default
+          const base_score    = Math.round(severity_base * classification.confidence);
+
+          // Base score integrity guard — must be finite and positive before penalties are applied.
+          if (!Number.isFinite(base_score) || base_score <= 0) {
+            console.error("🚨 INVALID BASE SCORE", { cwe: classification.cwe_id, confidence: classification.confidence });
+            throw new Error("INVALID_BASE_SCORE");
+          }
+
+          // Derive display label from numeric severity_base for logs and PR body.
+          const severity_label = severity_base >= 80 ? "high" : severity_base >= 70 ? "medium" : "low";
 
           const finalScore = computePriorityScore(
-            severityWeight,
+            severity_base,
             classification.confidence,
             judgePenalty,
             patchRisk,
@@ -1924,7 +1934,7 @@ export default {
           // Freeze the scoring payload immediately after calculation — prevents any downstream
           // reassignment from corrupting the values seen in the response and assertion logs.
           scorePayload = Object.freeze({
-            severity,
+            severity_base,
             confidence:           classification.confidence,
             judge_penalty:        judgePenalty    || 0,
             patch_risk:           patchRisk       || 0,
@@ -1933,10 +1943,11 @@ export default {
             final_priority_score: finalScore,
           });
 
-          console.log("FINAL SCORE DEBUG:", { severity, confidence: classification.confidence, finalScore });
+          console.log("FINAL SCORE DEBUG:", { cwe: classification.cwe_id, severity_base, base_score, confidence: classification.confidence, finalScore });
           console.log(JSON.stringify({
             event:            "final_scoring",
-            severity,
+            cwe_id:           classification.cwe_id,
+            severity_base,
             confidence:       classification.confidence,
             judge_penalty:    judgePenalty,
             lane_weight:      laneWeight,
@@ -1948,10 +1959,10 @@ export default {
           // ── Step 5e: Decision engine ──────────────────────────────────────
           pipelineStep = "github";
 
-          // Scoring guard — exact RCA fix: catch silent corruption immediately after freeze.
-          if (!scorePayload || typeof scorePayload.final_priority_score !== 'number' || scorePayload.final_priority_score <= 0) {
-            console.error('🚨 SCORING CORRUPTION DETECTED', scorePayload);
-            throw new Error('INVALID_SCORE_PAYLOAD');
+          // Scoring integrity guard — catch type corruption immediately after freeze.
+          if (!scorePayload || typeof scorePayload.final_priority_score !== "number") {
+            console.error("🚨 SCORING CORRUPTION DETECTED", scorePayload);
+            throw new Error("INVALID_SCORE_PAYLOAD");
           }
 
           // Fail-closed: judge failure or reject always escalates — score irrelevant
@@ -1968,20 +1979,20 @@ export default {
             // Remediation succeeded + score meets threshold — open PR, tier from file_path
             const complexity = analyseComplexity(file_path);
             console.log(JSON.stringify({ event: "complexity_analysis", tier: complexity.tier, ccn: complexity.ccn, fan_in: complexity.fan_in, taint_risk: complexity.taint_risk, action: complexity.action, file_path }));
-            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT, severity, finalScore, complexity);
+            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT, severity_label, finalScore, complexity);
             action = "pr_ready";
-            console.log(JSON.stringify({ event: "pr_created", cwe_id: classification.cwe_id, lane: classification.lane, final_score: finalScore, severity, tier: complexity.tier, pr_label: complexity.pr_label, fix_attempted: true, fix_generated: true }));
+            console.log(JSON.stringify({ event: "pr_created", cwe_id: classification.cwe_id, lane: classification.lane, final_score: finalScore, severity_base, severity_label, tier: complexity.tier, pr_label: complexity.pr_label, fix_attempted: true, fix_generated: true }));
           } else {
             // Remediation succeeded but score below threshold — escalate with diagnostic
             githubUrl = await openIssue(
               repo, file_path, classification,
-              { status: "cannot_fix", reason: `Priority score below threshold: ${finalScore}/100 (severity=${severity}, confidence=${classification.confidence.toFixed(2)}, laneWeight=${laneWeight}, patchRisk=${patchRisk}, mismatchPenalty=${mismatchPenalty})` },
+              { status: "cannot_fix", reason: `Priority score below threshold: ${finalScore}/100 (cwe=${classification.cwe_id}, severity_base=${severity_base}, confidence=${classification.confidence.toFixed(2)}, laneWeight=${laneWeight}, patchRisk=${patchRisk}, mismatchPenalty=${mismatchPenalty})` },
               env.GITHUB_PAT,
               env,
               "policy",
             );
             action = "issue_escalated";
-            console.log(JSON.stringify({ event: "score_gate_blocked", final_score: finalScore, severity, confidence: classification.confidence }));
+            console.log(JSON.stringify({ event: "score_gate_blocked", final_score: finalScore, severity_base, confidence: classification.confidence }));
           }
 
           // Update in-memory metrics (scoring path — has rpsScore + finalScore)
@@ -1999,7 +2010,7 @@ export default {
             repo,
             file_path,
             cwe_id:         classification.cwe_id,
-            severity:       scanner_severity,
+            severity:       severity_label,
             confidence:     classification.confidence,
             priority_score: finalScore,
             action,
@@ -2096,7 +2107,7 @@ export default {
           },
           remediation_status: remediation.status,
           priority: {
-            severity:             scorePayload.severity             ?? "unknown",
+            severity_base:        scorePayload.severity_base        ?? 80,
             confidence:           scorePayload.confidence           ?? classification.confidence,
             final_priority_score: scorePayload.final_priority_score ?? 0,
           },
