@@ -11,6 +11,7 @@ permissions:
 jobs:
   post-merge-guard:
     name: Post-Merge Guard — Regression Detection & Rollback
+    if: false # Phase 2 — disabled pending Better Stack observability integration
     runs-on: ubuntu-latest
 
     steps:

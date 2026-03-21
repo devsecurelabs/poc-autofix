@@ -133,7 +133,7 @@ Non-visible signals strictly influence risk scoring: CWE mismatch, retry occurre
 The sole approval authority of DevSecure.
 * **Tier A (Fast Gates):** Syntax validation, minimal diff enforcement, AST safety checks.
 * **Tier B (Heavy Gates):** Full test suite execution, security regression scanning.
-* **Tier C (Post-Merge Production Guardrails):** Integrates with Datadog/New Relic to trigger automated `git revert` if 5xx errors or latency spike within 15 minutes of merge.
+* **Tier C (Post-Merge Production Guardrails):** Integrates with Better Stack to trigger automated `git revert` if 5xx errors or latency spike within 15 minutes of merge.
 
 ---
 

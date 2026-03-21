@@ -1,13 +1,35 @@
-- name: Trigger DevSecure Orchestrator
+name: DevSecure Execution Plane
+
+on:
+  workflow_dispatch:
+    inputs:
+      results_json:
+        description: "Path to results.json (default: results.json)"
+        required: false
+        default: "results.json"
+
+jobs:
+  trigger-orchestrator:
+    name: Trigger DevSecure Orchestrator
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Trigger DevSecure Orchestrator
         env:
           WORKER_URL: ${{ secrets.CF_WORKER_URL || 'https://devsecure-orchestrator.quadri-jay.workers.dev' }}
           WORKER_SECRET: ${{ secrets.DEVSECURE_WORKER_SECRET }}
         run: |
-          # 1. Extract first finding's CVE metadata  
-          CVE_ID=$(jq -r '.results[0].extra.metadata.cve // empty' results.json)
-          FILE_PATH=$(jq -r '.results[0].path' results.json)
-          
-          # 2. POST to your Cloudflare Worker using the mapped secret
+          FILE_PATH=$(jq -r '.results[0].path // empty' results.json 2>/dev/null || echo "")
+          CVE_ID=$(jq -r '.results[0].extra.metadata.cve // empty' results.json 2>/dev/null || echo "")
+
+          if [ -z "$FILE_PATH" ] || [ "$FILE_PATH" == "null" ]; then
+            echo "No vulnerabilities found or results.json is empty. Exiting gracefully."
+            exit 0
+          fi
+
           curl -X POST "$WORKER_URL/remediate" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $WORKER_SECRET" \
