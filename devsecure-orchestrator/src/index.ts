@@ -15,6 +15,18 @@ const DEFAULT_CLASSIFIER_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct";
 const DEFAULT_REMEDIATION_MODEL = "Qwen/Qwen2.5-Coder-32B-Instruct";
 const GITHUB_API = "https://api.github.com";
 
+// Shared contract injected into every agent prompt — single source of behavioural truth.
+const AGENT_CONTRACT = {
+  goal: "Fix EXACT CWE vulnerability with minimal change",
+  constraints: [
+    "Do not refactor unrelated code",
+    "Do not delete business logic",
+    "Do not hardcode values",
+    "Preserve functionality",
+    "Use secure standard patterns",
+  ],
+};
+
 // Env is defined in env.ts and imported above.
 
 // ---------------------------------------------------------------------------
@@ -124,38 +136,32 @@ async function classify(
   apiKey: string,
   env: Env,
 ): Promise<ClassificationResult> {
-  const system = `You are a senior application security engineer specialising in static analysis.
-Return EXACTLY ONE valid JSON object. No markdown, no explanation, no extra text.
+  const system = `You are a security classifier.
 
-CRITICAL OUTPUT RULES:
-- Output starts with { and ends with }
-- No text before or after the JSON object
-- No markdown code fences (no \`\`\`json or \`\`\`)
-- If multiple vulnerabilities exist, return the MOST SEVERE one only — never an array
+Identify the primary CWE vulnerability.
 
-Schema:
+Output STRICT JSON:
 {
-  "cwe_id": "string (e.g. CWE-89)",
-  "cwe_name": "string",
-  "confidence": number (0.0 to 1.0),
-  "lane": number (1, 2, 3, or 4),
-  "summary": "string"
+  "cwe_id": "CWE-XXX",
+  "cwe_name": "Name of CWE",
+  "confidence": 0.0,
+  "lane": 1,
+  "summary": "short explanation"
 }
 
-If classification is not possible, return EXACTLY:
-{
-  "cwe_id": "UNKNOWN",
-  "cwe_name": "Unknown",
-  "confidence": 0,
-  "lane": 4,
-  "summary": "Unable to classify"
-}
+RULES:
+- No extra text
+- Must return exactly one CWE
+- All fields mandatory
+- No markdown code fences
 
-Lane assignment guide:
-  1 — Trivial: rename, constant swap, single-line sanitiser call
-  2 — Localised: logic change within one function, parameterised query, encoding fix
-  3 — Moderate: multi-function refactor, interface change, new dependency required
-  4 — Architectural or cannot assess: systemic design flaw, insufficient context`;
+Lane assignment:
+  1 — Trivial: single-line sanitiser call or constant swap
+  2 — Localised: logic change within one function
+  3 — Moderate: multi-function refactor required
+  4 — Architectural or cannot assess
+
+If classification is not possible return: {"cwe_id":"UNKNOWN","cwe_name":"Unknown","confidence":0,"lane":4,"summary":"Unable to classify"}`;
 
   const user = `Language: ${language}\n\nVulnerable code:\n\`\`\`${language}\n${code}\n\`\`\``;
 
@@ -241,39 +247,50 @@ async function remediate(
   ragContext: string,
   apiKey: string,
   env: Env,
+  uniqueCWEs: string[] = [classification.cwe_id],
 ): Promise<RemediationResult> {
-  const system = `You are an expert secure-code engineer. You will receive vulnerable source code, a structured vulnerability classification, and RAG context containing CWE-indexed secure coding patterns and verified historical patch exemplars.
+  const system = `You are a secure code patch generator.
 
-Your task: produce the minimal security fix — only change what is required to eliminate the vulnerability.
+GOAL:
+Fix ALL listed vulnerabilities in a SINGLE unified patch.
 
-Return ONLY valid JSON. Do not wrap the JSON in markdown blocks. No prose, no explanation outside the JSON.
-Schema:
+This file contains vulnerabilities:
+${uniqueCWEs.map(cwe => `- ${cwe}`).join("\n")}
+
+Constraints:
+${AGENT_CONTRACT.constraints.join("\n")}
+
+STRICT REQUIREMENTS:
+- Eliminate ALL vulnerabilities listed above
+- Do NOT partially fix
+- Do NOT remove business logic
+- Do NOT hardcode values
+- Do NOT introduce regressions
+- Do not change function signatures
+- Do not introduce new dependencies
+- Preserve all original comments, variable names, and indentation
+- Return the complete file in fixed_code — not a diff, not a partial snippet
+
+Output STRICT JSON only. No markdown. No prose outside the JSON.
 {
-  "fixed_code": "string (the full fixed file code)",
-  "explanation": "string (one sentence describing the fix applied)"
+  "fixed_code": "<full updated file>",
+  "explanation": "<brief summary>"
 }
 
-If you cannot fix the vulnerability (low confidence, architectural issue, or insufficient context):
+If you cannot fix the vulnerabilities:
 {
   "fixed_code": "",
-  "explanation": "string (reason why a fix cannot be safely generated)"
-}
+  "explanation": "<reason why a fix cannot be safely generated>"
+}`;
 
-Hard constraints:
-- Do NOT alter program behaviour beyond the security fix
-- Do NOT add features, refactor unrelated code, or change formatting
-- Preserve all original comments, variable names, and indentation
-- Return the complete file in fixed_code — not a diff, not a partial snippet`;
-
-  const user = `## Vulnerability Classification (from Qwen2.5)
-\`\`\`json
-${JSON.stringify(classification, null, 2)}
-\`\`\`
+  const user = `## Vulnerabilities to fix
+${uniqueCWEs.map(cwe => `- ${cwe}`).join("\n")}
+summary: ${classification.summary}
 
 ## RAG Context — CWE Knowledge Base (${classification.cwe_id})
 ${ragContext}
 
-## Original ${language} code to fix
+## Original code to fix
 \`\`\`${language}
 ${code}
 \`\`\``;
@@ -289,27 +306,36 @@ ${code}
   // Strip markdown code-fences, extract the JSON object, then parse.
   let cleanL3 = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
   const matchL3 = cleanL3.match(/\{[\s\S]*\}/);
-  const finalL3Text = matchL3 ? matchL3[0] : cleanL3;
+  const autofix_response = matchL3 ? matchL3[0] : cleanL3;
+
+  let fix_result: { fixed_code?: string; explanation?: string };
+  let remediation_status: "fixed" | "cannot_fix" = "fixed";
 
   try {
-    const parsed = JSON.parse(finalL3Text) as { fixed_code?: string; explanation?: string };
-
-    // Map to RemediationResult: empty/missing fixed_code → cannot_fix
-    if (!parsed.fixed_code || parsed.fixed_code.trim() === "") {
-      return {
-        status: "cannot_fix",
-        reason: parsed.explanation ?? "L3 model returned empty fixed_code — cannot safely generate a patch.",
-      };
-    }
-    return {
-      status:      "fixed",
-      fixed_code:  parsed.fixed_code,
-      explanation: parsed.explanation ?? "",
-    };
-  } catch (error) {
-    console.error("L3 Parse Error:", error, "Raw Output:", raw);
-    throw new Error(`L3 Surgeon JSON parse failed: ${error instanceof Error ? error.message : String(error)}`);
+    fix_result = JSON.parse(autofix_response) as { fixed_code?: string; explanation?: string };
+  } catch (e) {
+    console.error(JSON.stringify({ event: "AUTOFIX_JSON_PARSE_FAILURE", raw: autofix_response.slice(0, 500) }));
+    fix_result = { fixed_code: code, explanation: "Malformed LLM output" };
+    remediation_status = "cannot_fix";
   }
+
+  // Empty fixed_code → cannot_fix
+  if (!fix_result.fixed_code || fix_result.fixed_code.trim() === "") {
+    return {
+      status: "cannot_fix",
+      reason: fix_result.explanation ?? "L3 model returned empty fixed_code — cannot safely generate a patch.",
+    };
+  }
+
+  if (remediation_status === "cannot_fix") {
+    return { status: "cannot_fix", reason: fix_result.explanation ?? "Malformed LLM output" };
+  }
+
+  return {
+    status:      "fixed",
+    fixed_code:  fix_result.fixed_code,
+    explanation: fix_result.explanation ?? "",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -348,12 +374,13 @@ async function remediateWithRetry(
   ragContext: string,
   apiKey: string,
   env: Env,
+  uniqueCWEs?: string[],
 ): Promise<RemediationResult> {
   const MAX_ATTEMPTS = 2;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       console.log("Remediation attempt:", attempt);
-      const result = await remediate(code, language, classification, ragContext, apiKey, env);
+      const result = await remediate(code, language, classification, ragContext, apiKey, env, uniqueCWEs);
       validateRemediation(result);
       return result;
     } catch (err) {
@@ -714,14 +741,46 @@ const COMPLEX_CWES = ["CWE-89", "CWE-78", "CWE-22", "CWE-79", "CWE-94"];
 // Scoring is derived purely from vulnerability class, not external detection signals.
 // Fail-closed default: 80 (HIGH) for any unrecognised CWE.
 const CWE_SEVERITY: Record<string, number> = {
-  "CWE-78":  80,  // Command Injection
-  "CWE-89":  80,  // SQL Injection
-  "CWE-79":  70,  // XSS
-  "CWE-22":  75,  // Path Traversal
-  "CWE-94":  80,  // Code Injection
-  "CWE-287": 75,  // Authentication Bypass
-  "CWE-502": 75,  // Deserialization
-  "CWE-611": 70,  // XXE
+  // ── Injection / RCE (Critical) ───────────────────────────────────────────
+  "CWE-78":  90,  // OS Command Injection
+  "CWE-89":  90,  // SQL Injection
+  "CWE-77":  90,  // Command Injection (generic)
+  "CWE-94":  85,  // Code Injection
+  "CWE-502": 90,  // Deserialization of Untrusted Data
+  "CWE-20":  80,  // Improper Input Validation
+
+  // ── Authentication / Access Control (High) ──────────────────────────────
+  "CWE-287": 85,  // Improper Authentication
+  "CWE-284": 80,  // Improper Access Control
+  "CWE-862": 85,  // Missing Authorization
+  "CWE-269": 85,  // Improper Privilege Management
+  "CWE-522": 80,  // Insufficiently Protected Credentials
+
+  // ── Sensitive Data Exposure (Medium-High) ───────────────────────────────
+  "CWE-200": 75,  // Exposure of Sensitive Information
+  "CWE-319": 75,  // Cleartext Transmission of Sensitive Data
+  "CWE-327": 75,  // Use of Broken/Risky Cryptographic Algorithm
+  "CWE-326": 75,  // Inadequate Encryption Strength
+
+  // ── Client-Side / Web (Medium) ──────────────────────────────────────────
+  "CWE-79":  70,  // Cross-Site Scripting (XSS)
+  "CWE-352": 70,  // Cross-Site Request Forgery (CSRF)
+  "CWE-601": 65,  // Open Redirect
+
+  // ── File / Path (High) ──────────────────────────────────────────────────
+  "CWE-22":  80,  // Path Traversal
+  "CWE-434": 80,  // Unrestricted File Upload
+  "CWE-73":  75,  // External Control of File Name or Path
+
+  // ── Resource / Memory (Medium) ──────────────────────────────────────────
+  "CWE-400": 65,  // Uncontrolled Resource Consumption
+  "CWE-476": 60,  // NULL Pointer Dereference
+  "CWE-787": 85,  // Out-of-bounds Write
+
+  // ── Configuration / Info Disclosure (Low-Medium) ────────────────────────
+  "CWE-16":  60,  // Configuration
+  "CWE-209": 60,  // Error Message Information Exposure
+  "CWE-215": 60,  // Information Exposure Through Debug Info
 };
 
 // Compute the final priority score from CWE-derived severity_base and L2 LLM confidence,
@@ -739,6 +798,154 @@ function computePriorityScore(
 }
 
 // ---------------------------------------------------------------------------
+// Deterministic Scoring Harness
+// ---------------------------------------------------------------------------
+
+/**
+ * resolveBaseScore — pure function, zero side effects except structured debug log.
+ * Single source of truth for severity_base resolution and base_score computation.
+ * scanner_severity is accepted for test harness parity but NEVER used in production
+ * (always passed as null from the main scoring path — Fusion Score model).
+ */
+function resolveBaseScore({
+  scanner_severity,
+  cwe_id,
+  confidence,
+}: {
+  scanner_severity: string | null;
+  cwe_id: string;
+  confidence: number;
+}): { severity_base: number; base_score: number } {
+  // Embedded maps — harness is self-contained, no module-level state dependency.
+  const SEVERITY_WEIGHTS: Record<string, number> = { critical: 100, high: 80, medium: 50, low: 20 };
+  const CWE_SEVERITY_LOCAL: Record<string, number> = {
+    "CWE-78": 90, "CWE-89": 90, "CWE-77": 90, "CWE-94": 85, "CWE-502": 90, "CWE-20": 80,
+    "CWE-287": 85, "CWE-284": 80, "CWE-862": 85, "CWE-269": 85, "CWE-522": 80,
+    "CWE-200": 75, "CWE-319": 75, "CWE-327": 75, "CWE-326": 75,
+    "CWE-79": 70, "CWE-352": 70, "CWE-601": 65,
+    "CWE-22": 80, "CWE-434": 80, "CWE-73": 75,
+    "CWE-400": 65, "CWE-476": 60, "CWE-787": 85,
+    "CWE-16": 60, "CWE-209": 60, "CWE-215": 60,
+  };
+
+  const safe_scanner_severity =
+    typeof scanner_severity === "string" ? scanner_severity.toLowerCase() : null;
+
+  // Resolution priority: scanner_severity (if valid) → CWE map → fail-closed default 80.
+  const severity_base =
+    (safe_scanner_severity && SEVERITY_WEIGHTS[safe_scanner_severity] !== undefined)
+      ? SEVERITY_WEIGHTS[safe_scanner_severity]
+      : (CWE_SEVERITY_LOCAL[cwe_id] ?? 80);
+
+  console.log(JSON.stringify({
+    event:              "resolve_base_score",
+    scanner_severity,
+    normalized_scanner: safe_scanner_severity,
+    cwe_id,
+    severity_base,
+    confidence,
+    base_score:         Math.round(severity_base * confidence),
+  }));
+
+  const base_score = Math.round(severity_base * confidence);
+
+  if (!Number.isFinite(base_score) || base_score <= 0) {
+    console.error(JSON.stringify({
+      event: "INVALID_BASE_SCORE",
+      scanner_severity,
+      cwe_id,
+      confidence,
+      severity_base,
+    }));
+    throw new Error("INVALID_BASE_SCORE");
+  }
+
+  return { severity_base, base_score };
+}
+
+/**
+ * runScoringValidation — dev-only test harness.
+ * Throws on any assertion failure so CI surfaces the regression immediately.
+ * Gated by NODE_ENV === "development" — never runs in production CF Workers.
+ */
+function runScoringValidation(): void {
+  interface TestCase {
+    label: string;
+    input: { scanner_severity: string | null; cwe_id: string; confidence: number };
+    expect: { severity_base: number; base_score: number };
+  }
+
+  const cases: TestCase[] = [
+    {
+      label: "Known CWE, no scanner severity",
+      input: { scanner_severity: null, cwe_id: "CWE-89", confidence: 0.9 },
+      expect: { severity_base: 80, base_score: 72 },
+    },
+    {
+      label: "Unknown CWE falls back to default 80",
+      input: { scanner_severity: null, cwe_id: "CWE-9999", confidence: 0.8 },
+      expect: { severity_base: 80, base_score: 64 },
+    },
+    {
+      label: "scanner_severity=high overrides CWE map",
+      input: { scanner_severity: "high", cwe_id: "CWE-79", confidence: 1.0 },
+      expect: { severity_base: 80, base_score: 80 },
+    },
+    {
+      label: "scanner_severity=critical maps to 100",
+      input: { scanner_severity: "critical", cwe_id: "CWE-22", confidence: 0.95 },
+      expect: { severity_base: 100, base_score: 95 },
+    },
+    {
+      label: "Path traversal CWE-22 at 0.75 confidence",
+      input: { scanner_severity: null, cwe_id: "CWE-22", confidence: 0.75 },
+      expect: { severity_base: 75, base_score: 56 },
+    },
+    {
+      label: "scanner_severity=medium overrides high-severity CWE",
+      input: { scanner_severity: "medium", cwe_id: "CWE-89", confidence: 1.0 },
+      expect: { severity_base: 50, base_score: 50 },
+    },
+  ];
+
+  let passed = 0;
+  const failures: string[] = [];
+
+  for (const tc of cases) {
+    try {
+      const result = resolveBaseScore(tc.input);
+      if (result.severity_base !== tc.expect.severity_base || result.base_score !== tc.expect.base_score) {
+        failures.push(
+          `FAIL [${tc.label}]: expected severity_base=${tc.expect.severity_base} base_score=${tc.expect.base_score}, ` +
+          `got severity_base=${result.severity_base} base_score=${result.base_score}`,
+        );
+      } else {
+        passed++;
+        console.log(JSON.stringify({ event: "validation_pass", label: tc.label }));
+      }
+    } catch (err) {
+      failures.push(`FAIL [${tc.label}]: threw unexpectedly — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  console.log(JSON.stringify({
+    event:   "scoring_validation_complete",
+    passed,
+    failed:  failures.length,
+    total:   cases.length,
+  }));
+
+  if (failures.length > 0) {
+    throw new Error(`Scoring validation failed (${failures.length}/${cases.length}):\n${failures.join("\n")}`);
+  }
+}
+
+// Dev-only gate — CF Workers never set NODE_ENV; this branch is dead in production.
+if (typeof process !== "undefined" && process.env.NODE_ENV === "development") {
+  runScoringValidation();
+}
+
+// ---------------------------------------------------------------------------
 // Diversity Judge
 // ---------------------------------------------------------------------------
 
@@ -749,42 +956,58 @@ const JUDGE_TIMEOUT_MS = 5000;
 interface JudgeVerdict {
   verdict: "approve" | "reject";
   confidence: number;
-  issues: string[];
-  reason: string;
+  issues: number | string[];
+  reason?: string;
+  adversarial_analysis?: string;
+  checklist?: Record<string, boolean>;
 }
 
 async function judgeReview(
   originalCode: string,
   fixedCode: string,
+  uniqueCWEs: string[],
   classification: ClassificationResult,
   env: Env,
 ): Promise<JudgeVerdict> {
   const model = env.JUDGE_MODEL || DEFAULT_JUDGE_MODEL;
 
-  const system = `You are an independent security code reviewer. You will receive an original vulnerable code snippet, a proposed fix, and a vulnerability classification.
+  const system = `You are a Red Team exploit developer.
 
-Your ONLY task is to critique the proposed fix. You MUST NOT generate new code.
+The file originally had these vulnerabilities:
+${uniqueCWEs.map(cwe => `- ${cwe}`).join("\n")}
 
-Return ONLY a valid JSON object. No prose. No markdown. No explanation outside the JSON.
+The patch was generated under these constraints:
+${AGENT_CONTRACT.constraints.join("\n")}
 
-Required schema:
+TASK:
+Attempt to exploit the patched code.
+
+RULES:
+- If ANY vulnerability remains → REJECT
+- If business logic is broken → REJECT
+
+Before verdict:
+- explain exploit attempt
+- prove whether it is blocked
+
+Output STRICT JSON only. No prose. No markdown outside the JSON.
+
 {
-  "verdict": "approve" | "reject",
-  "confidence": <0.0-1.0>,
-  "issues": ["<issue description>", ...],
-  "reason": "<concise one-sentence critique>"
-}
+  "adversarial_analysis": "...",
+  "checklist": {
+    "all_vulnerabilities_removed": true,
+    "preserved_original_business_logic": true,
+    "did_not_hardcode_values": true,
+    "did_not_delete_functionality": true
+  },
+  "verdict": "approve",
+  "confidence": 0.0,
+  "issues": 0
+}`;
 
-verdict rules:
-- "approve" if the fix correctly eliminates the vulnerability without breaking behaviour
-- "reject" if the fix is incomplete, incorrect, introduces new risk, or alters unrelated behaviour
-
-issues: empty array [] if no issues found.`;
-
-  const user = `## Vulnerability Classification
-\`\`\`json
-${JSON.stringify(classification, null, 2)}
-\`\`\`
+  const user = `## Vulnerabilities targeted
+${uniqueCWEs.map(cwe => `- ${cwe}`).join("\n")}
+summary: ${classification.summary}
 
 ## Original Code
 \`\`\`
@@ -813,7 +1036,7 @@ ${fixedCode.slice(0, 2000)}
           { role: "system", content: system },
           { role: "user", content: user },
         ],
-        max_tokens: 512,
+        max_tokens: 768,
         stream: false,
       }),
       signal: controller.signal,
@@ -830,32 +1053,54 @@ ${fixedCode.slice(0, 2000)}
     clearTimeout(timeoutId);
   }
 
+  // ── Safe JSON parsing (fail-closed) ─────────────────────────────────────
   const match = raw.match(/\{[\s\S]*\}/);
-  if (!match) {
-    throw new Error(`Judge did not return JSON. Raw output length: ${raw.length}`);
-  }
+  const judge_response = match ? match[0] : raw;
 
-  let verdict: JudgeVerdict;
+  let judge_result: JudgeVerdict;
   try {
-    verdict = JSON.parse(match[0]) as JudgeVerdict;
+    judge_result = JSON.parse(judge_response) as JudgeVerdict;
   } catch (e) {
-    throw new Error(`Judge JSON parse failed: ${e instanceof Error ? e.message : String(e)}`);
+    console.error(JSON.stringify({ event: "JUDGE_JSON_PARSE_FAILURE", raw: judge_response.slice(0, 500) }));
+    judge_result = { verdict: "reject", checklist: {}, issues: 10, confidence: 0 };
   }
 
-  if (!verdict.verdict || (verdict.verdict !== "approve" && verdict.verdict !== "reject")) {
-    throw new Error(`Judge returned invalid verdict: "${verdict.verdict}"`);
-  }
-  if (typeof verdict.confidence !== "number") {
-    throw new Error("Judge response missing numeric confidence");
-  }
-  if (!verdict.reason || verdict.reason.trim() === "") {
-    throw new Error("Judge response missing non-empty reason");
-  }
-  if (!Array.isArray(verdict.issues)) {
-    throw new Error("Judge response missing issues array");
+  // ── Deterministic checklist gate (fail-closed) ───────────────────────────
+  const checklist = judge_result?.checklist;
+  const requiredChecks = [
+    "all_vulnerabilities_removed",
+    "preserved_original_business_logic",
+    "did_not_hardcode_values",
+    "did_not_delete_functionality",
+  ];
+
+  const failedChecks = requiredChecks.filter(key => checklist?.[key] !== true);
+  if (failedChecks.length > 0) {
+    console.warn(JSON.stringify({ event: "JUDGE_CHECKLIST_FAILED", failed: failedChecks }));
+    judge_result.verdict = "reject";
+    judge_result.issues = Math.max(typeof judge_result.issues === "number" ? judge_result.issues : 0, failedChecks.length * 5);
   }
 
-  return verdict;
+  // ── Final verdict normalisation ──────────────────────────────────────────
+  if (judge_result.verdict !== "approve" && judge_result.verdict !== "reject") {
+    console.error(JSON.stringify({ event: "JUDGE_INVALID_VERDICT", verdict: judge_result.verdict }));
+    judge_result.verdict = "reject";
+  }
+  if (typeof judge_result.confidence !== "number" || !Number.isFinite(judge_result.confidence)) {
+    judge_result.confidence = 0;
+  }
+  // Normalise issues to string[] — downstream code uses .length / .join.
+  // If checklist gate wrote a numeric penalty count, convert to synthetic entries.
+  if (typeof judge_result.issues === "number") {
+    const count = judge_result.issues as number;
+    judge_result.issues = count > 0
+      ? Array.from({ length: count }, (_, i) => `checklist_failure_${i + 1}`)
+      : [];
+  } else if (!Array.isArray(judge_result.issues)) {
+    judge_result.issues = [];
+  }
+
+  return judge_result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1649,6 +1894,19 @@ export default {
         );
       }
 
+      // ── Multi-CWE aggregation — L2 anchored, detection-enriched ──────────
+      if (!classification?.cwe_id) throw new Error("MISSING_PRIMARY_CWE");
+      const primaryCWE = classification.cwe_id;
+      // Derive secondary CWEs from the detection hint (single source in PoC; array-ready for v2)
+      const detected_issues: Array<{ cwe_id?: string }> = ds_detection?.cwe_hint
+        ? [{ cwe_id: ds_detection.cwe_hint }]
+        : [];
+      const secondaryCWEs = (Array.isArray(detected_issues) ? detected_issues : [])
+        .map((i) => i.cwe_id)
+        .filter((cwe): cwe is string => !!cwe && cwe !== primaryCWE);
+      const uniqueCWEs = [primaryCWE, ...new Set(secondaryCWEs)].slice(0, 3);
+      console.log("Multi-CWE remediation targeting:", uniqueCWEs);
+
       // ── Step 4: Remediation ───────────────────────────────────────────────
       pipelineStep = "remediation";
       console.log("Calling remediation model: " + (env.REMEDIATION_MODEL || DEFAULT_REMEDIATION_MODEL));
@@ -1659,7 +1917,7 @@ export default {
         // We monkey-patch by catching attempt-1 failure at this level without re-running.
         let attempt1Succeeded = false;
         try {
-          const result1 = await remediate(code, language, classification, ragContext, env.HF_API_KEY, env);
+          const result1 = await remediate(code, language, classification, ragContext, env.HF_API_KEY, env, uniqueCWEs);
           validateRemediation(result1);
           remediation = result1;
           attempt1Succeeded = true;
@@ -1667,7 +1925,7 @@ export default {
           remediationRequiredRetry = true;
         }
         if (!attempt1Succeeded) {
-          remediation = await remediateWithRetry(code, language, classification, ragContext, env.HF_API_KEY, env);
+          remediation = await remediateWithRetry(code, language, classification, ragContext, env.HF_API_KEY, env, uniqueCWEs);
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1706,6 +1964,10 @@ export default {
       let githubUrl: string;
       let action: "pr_opened" | "pr_ready" | "issue_escalated";
       let judgeWasRun = false;
+      // Deterministic gate flags — remediation_status is derived ONLY from these two.
+      // Never trust LLM output or patch existence to set "fixed".
+      let patch_guard_allowed = false;
+      let tierA_passed = false;
       // Pre-populated with safe defaults so downstream reads never see undefined/0 from
       // a missing scoring pass (e.g. remediation.status === "cannot_fix" early exit).
       let scorePayload = {
@@ -1803,11 +2065,10 @@ export default {
             env,
             "policy",
           );
-          // Explicit state update — ensures State Integrity Matrix sees cannot_fix when
-          // Patch Guard blocks, preventing a ROUTING_INTEGRITY_VIOLATION false positive.
-          remediation.status = "cannot_fix";
           action = "issue_escalated";
+          // patch_guard_allowed stays false — deterministic gate remains closed
         } else {
+          patch_guard_allowed = true; // Patch Guard passed — gate 1 of 2 cleared
           // ── Step 5b: Diversity Judge (risk-triggered, fail-closed) ───────────
           pipelineStep = "judge";
           const judgeTriggerReasons: string[] = [];
@@ -1835,7 +2096,8 @@ export default {
             }));
             try {
               judgeWasRun = true;
-              const judgeResult = await judgeReview(code, decoded, classification, env);
+              console.log("Enforcing Agent Contract for:", classification.cwe_id);
+              const judgeResult = await judgeReview(code, decoded, uniqueCWEs, classification, env);
 
               // Strict mode when cwe_mismatch: require explicit approve + confidence >= 0.85 + no issues
               const effectiveReject = cwe_mismatch
@@ -1909,15 +2171,16 @@ export default {
             else                   mismatchPenalty = 15;
           }
 
-          // ── Fusion Score: CWE-based severity — no dependency on external detection signals ─
-          const severity_base = CWE_SEVERITY[classification.cwe_id] ?? 80; // fail-closed default
-          const base_score    = Math.round(severity_base * classification.confidence);
+          // ── Fusion Score: CWE-based severity — scanner_severity passed as null (production) ─
+          // resolveBaseScore is the single source of truth; throws INVALID_BASE_SCORE on corruption.
+          const { severity_base, base_score } = resolveBaseScore({
+            scanner_severity: null,
+            cwe_id:           classification.cwe_id,
+            confidence:       classification.confidence,
+          });
 
-          // Base score integrity guard — must be finite and positive before penalties are applied.
-          if (!Number.isFinite(base_score) || base_score <= 0) {
-            console.error("🚨 INVALID BASE SCORE", { cwe: classification.cwe_id, confidence: classification.confidence });
-            throw new Error("INVALID_BASE_SCORE");
-          }
+          console.log("CWE:", classification.cwe_id);
+          console.log("Severity Base:", severity_base);
 
           // Derive display label from numeric severity_base for logs and PR body.
           const severity_label = severity_base >= 80 ? "high" : severity_base >= 70 ? "medium" : "low";
@@ -1930,6 +2193,12 @@ export default {
             laneWeight,
             mismatchPenalty,
           );
+
+          // Final score integrity guard — catches NaN/Infinity from penalty arithmetic.
+          if (!Number.isFinite(finalScore)) {
+            console.error(JSON.stringify({ event: "INVALID_FINAL_SCORE", severity_base, confidence: classification.confidence, judgePenalty, patchRisk, laneWeight, mismatchPenalty }));
+            throw new Error("INVALID_FINAL_SCORE");
+          }
 
           // Freeze the scoring payload immediately after calculation — prevents any downstream
           // reassignment from corrupting the values seen in the response and assertion logs.
@@ -1976,7 +2245,8 @@ export default {
             );
             action = "issue_escalated";
           } else if (finalScore >= 70) {
-            // Remediation succeeded + score meets threshold — open PR, tier from file_path
+            // Both deterministic gates passed — safe to mark as fixed and open PR
+            tierA_passed = true; // gate 2 of 2 cleared: score threshold met, no judge block
             const complexity = analyseComplexity(file_path);
             console.log(JSON.stringify({ event: "complexity_analysis", tier: complexity.tier, ccn: complexity.ccn, fan_in: complexity.fan_in, taint_risk: complexity.taint_risk, action: complexity.action, file_path }));
             githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT, severity_label, finalScore, complexity);
@@ -2047,7 +2317,10 @@ export default {
       ].join(" → ");
 
       // --- Board-Approved State Integrity Matrix ---
-      const remediation_status = remediation.status;
+      // Deterministic authority only — never derived from LLM output or patch existence.
+      // "fixed" requires BOTH gates: Patch Guard passed AND score threshold met (no judge block).
+      const remediation_status: "fixed" | "cannot_fix" =
+        (patch_guard_allowed && tierA_passed) ? "fixed" : "cannot_fix";
 
       if (!action || !remediation_status) {
         throw new Error("INVALID_STATE_INPUT: action or remediation_status is undefined");
@@ -2105,7 +2378,7 @@ export default {
             factors:       explainabilityFactors,
             decision_path: decisionPath,
           },
-          remediation_status: remediation.status,
+          remediation_status,
           priority: {
             severity_base:        scorePayload.severity_base        ?? 80,
             confidence:           scorePayload.confidence           ?? classification.confidence,
