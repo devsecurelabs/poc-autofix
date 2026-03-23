@@ -2203,15 +2203,12 @@ export default {
 
       if (remediation.status === "cannot_fix") {
         // L4 escalation path → open GitHub Issue
-        githubUrl = await openIssue(
-          repo,
-          file_path,
-          classification,
-          remediation,
-          env.GITHUB_PAT,
-          env,
-          "model",
-        );
+          githubUrl = await openIssue(
+              repo, file_path, classification, remediation,
+              env.GITHUB_PAT, env, "model",
+              { scorePayload: preGateScore, target_language }
+          );
+
         action = "issue_escalated";
       } else {
         // ── Apply patch: fixed_code (V2) or search/replace fallback (legacy) ─

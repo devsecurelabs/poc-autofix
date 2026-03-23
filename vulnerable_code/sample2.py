@@ -32,7 +32,7 @@ def ping():
     ip = request.args.get('ip')
 
     # ❌ Directly passing user input into shell     
-    result = os.popen(f"ping -c 1 {ip}").read()
+    result = os.popen(f"ping -c 1 {ip}").read() 
 
     return f"<pre>{result}</pre>"
 
