@@ -77,6 +77,23 @@ jobs:
           SEVERITY_RANK = {"ERROR": 3, "WARNING": 2, "INFO": 1}
           EMPTY = {"available": False}
 
+          def extract_cwe(metadata):
+              """Normalise CWE — e.g. ["CWE-89: SQL Injection"] → "CWE-89". Returns None if absent."""
+              raw = metadata.get("cwe") or metadata.get("cwe-id")
+              if not raw:
+                  return None
+              if isinstance(raw, list):
+                  raw = raw[0]
+              token = str(raw).split(":")[0].strip()
+              return token if token.upper().startswith("CWE-") else None
+
+          def extract_cve(metadata):
+              """CVE — optional enrichment only; never inferred."""
+              raw = metadata.get("cve") or metadata.get("cve-id")
+              if raw and str(raw).upper().startswith("CVE-"):
+                  return str(raw)
+              return None
+
           try:
               with open("scan_results.json") as f:
                   raw = json.load(f)
@@ -91,34 +108,46 @@ jobs:
               json.dump(EMPTY, open("ds_detection.json", "w"))
               sys.exit(0)
 
-          # Select highest-severity finding; stable (first match wins on tie)
-          best = max(results, key=lambda r: SEVERITY_RANK.get(
-              r.get("extra", {}).get("severity", "INFO").upper(), 0))
+          # Sort all results by severity descending; stable (first match wins on tie)
+          ranked = sorted(results, key=lambda r: SEVERITY_RANK.get(
+              r.get("extra", {}).get("severity", "INFO").upper(), 0), reverse=True)
 
-          metadata = best.get("extra", {}).get("metadata", {})
+          # Primary finding — backward-compat ds_detection object
+          best = ranked[0]
+          meta_best = best.get("extra", {}).get("metadata", {})
+          primary_cwe = extract_cwe(meta_best)
+          primary_cve = extract_cve(meta_best)
+          primary_rule = best.get("check_id", "unknown")
 
-          # Normalise CWE — e.g. ["CWE-89: SQL Injection"] → "CWE-89"
-          raw_cwe = metadata.get("cwe") or metadata.get("cwe-id")
-          cwe_hint = None
-          if raw_cwe:
-              if isinstance(raw_cwe, list):
-                  raw_cwe = raw_cwe[0]
-              token = str(raw_cwe).split(":")[0].strip()
-              if token.upper().startswith("CWE-"):
-                  cwe_hint = token
+          ds = {"type": "static_code", "rule_id": primary_rule}
+          if primary_cwe: ds["cwe_hint"] = primary_cwe
+          if primary_cve: ds["cve_id"]   = primary_cve
 
-          # CVE — optional; never inferred
-          cve_raw = metadata.get("cve") or metadata.get("cve-id")
-          cve_id = str(cve_raw) if cve_raw and str(cve_raw).upper().startswith("CVE-") else None
+          # Multi-CWE detected_issues array — up to 3 unique CWE findings, ranked by severity
+          seen_cwes = set()
+          detected_issues = []
+          for finding in ranked:
+              if len(detected_issues) >= 3:
+                  break
+              meta = finding.get("extra", {}).get("metadata", {})
+              cwe = extract_cwe(meta)
+              rule = finding.get("check_id", "unknown")
+              if cwe and cwe not in seen_cwes:
+                  seen_cwes.add(cwe)
+                  entry = {"cwe_id": cwe, "rule_id": rule}
+                  cve = extract_cve(meta)
+                  if cve:
+                      entry["cve_id"] = cve
+                  detected_issues.append(entry)
 
-          rule_id = best.get("check_id", "unknown")
-
-          ds = {"type": "static_code", "rule_id": rule_id}
-          if cwe_hint: ds["cwe_hint"] = cwe_hint
-          if cve_id:   ds["cve_id"]   = cve_id
-
-          json.dump({"available": True, "ds_detection": ds}, open("ds_detection.json", "w"))
-          print(f"[DETECTION] Signal normalised — rule={rule_id} cwe={cwe_hint} cve={cve_id}")
+          output = {
+              "available": True,
+              "ds_detection": ds,
+              "detected_issues": detected_issues,
+          }
+          json.dump(output, open("ds_detection.json", "w"))
+          print(f"[DETECTION] Signal normalised — primary rule={primary_rule} cwe={primary_cwe} cve={primary_cve}")
+          print(f"[DETECTION] detected_issues ({len(detected_issues)}): {[i['cwe_id'] for i in detected_issues]}")
           PYEOF
 
       - name: Send to Cloudflare Worker and Save Fix
@@ -146,9 +175,11 @@ jobs:
           DS_AVAILABLE=$(jq -r '.available // false' ds_detection.json 2>/dev/null || echo "false")
           if [ "$DS_AVAILABLE" = "true" ]; then
             DS_PAYLOAD=$(jq '.ds_detection' ds_detection.json)
-            echo "[DETECTION] Signal present — injecting into request."
+            DI_PAYLOAD=$(jq '.detected_issues // []' ds_detection.json)
+            echo "[DETECTION] Signal present — injecting ds_detection and detected_issues into request."
           else
             DS_PAYLOAD="null"
+            DI_PAYLOAD="[]"
             echo "[DETECTION] No signal — proceeding without detection context."
           fi
 
@@ -166,9 +197,9 @@ jobs:
               continue
             fi
 
-            # Guard: restrict to supported source extensions
+            # Guard: restrict to supported source extensions (matches trigger-devsecure.yml)
             case "$file" in
-              *.py|*.js|*.ts|*.php) ;;
+              *.py|*.js|*.ts|*.php|*.java|*.rb|*.cs|*.dart) ;;
               *) echo "⚠️ Skipping unsupported file: $file"; continue ;;
             esac
 
@@ -179,21 +210,35 @@ jobs:
             name="${filename%.*}"
             output_path="remediated_code/${name}_fixed.${extension}"
 
-            # Build payload — include ds_detection only when available
+            # Normalise extension → canonical language name (matches trigger-devsecure.yml)
+            case "$extension" in
+              py)   LANG="python"     ;;
+              js)   LANG="javascript" ;;
+              ts)   LANG="typescript" ;;
+              java) LANG="java"       ;;
+              php)  LANG="php"        ;;
+              rb)   LANG="ruby"       ;;
+              cs)   LANG="csharp"     ;;
+              dart) LANG="dart"       ;;
+              *)    LANG="$extension" ;;
+            esac
+
+            # Build payload — include ds_detection and detected_issues when available
             if [ "$DS_AVAILABLE" = "true" ]; then
               JSON_PAYLOAD=$(jq -n \
                 --arg repo "${{ github.repository }}" \
                 --arg path "$file" \
                 --rawfile code "$file" \
-                --arg lang "$extension" \
+                --arg lang "$LANG" \
                 --argjson ds_detection "$DS_PAYLOAD" \
-                '{repo: $repo, file_path: $path, code: $code, language: $lang, ds_detection: $ds_detection}')
+                --argjson detected_issues "$DI_PAYLOAD" \
+                '{repo: $repo, file_path: $path, code: $code, language: $lang, ds_detection: $ds_detection, detected_issues: $detected_issues}')
             else
               JSON_PAYLOAD=$(jq -n \
                 --arg repo "${{ github.repository }}" \
                 --arg path "$file" \
                 --rawfile code "$file" \
-                --arg lang "$extension" \
+                --arg lang "$LANG" \
                 '{repo: $repo, file_path: $path, code: $code, language: $lang}')
             fi
 

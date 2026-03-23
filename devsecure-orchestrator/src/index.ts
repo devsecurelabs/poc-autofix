@@ -80,8 +80,9 @@ interface RemediationRequest {
   code: string;         // raw vulnerable source code (legacy field)
   language: string;     // "python" | "javascript" | etc. (legacy field)
   base_branch?: string; // branch to target, defaults to "main"
-  ds_detection?: DsDetection;  // normalized detection input layer
+  ds_detection?: DsDetection;  // normalized detection input layer (primary — backward compat)
   code_context?: CodeContext;  // normalized code input layer
+  detected_issues?: Array<{ cwe_id: string; rule_id?: string }>; // multi-CWE array from CI (Task 5)
 }
 
 interface ClassificationResult {
@@ -239,8 +240,11 @@ async function retrieveRagContext(
   summary: string,
   vectorIndex: Vectorize,
   env: Env,
+  language?: string,
 ): Promise<string> {
-  const queryText = `${cweId} remediation secure coding pattern: ${summary}`;
+  const langPrefix = language && language !== "unknown" ? `${language} ` : "";
+  if (!langPrefix) console.warn("RAG query: language missing or unknown — using CWE-only query");
+  const queryText = `${langPrefix}${cweId} remediation secure coding pattern: ${summary}`;
   const vector = await getEmbedding(queryText, env);
 
   const results = await vectorIndex.query(vector, { topK: 3, returnMetadata: "all" });
@@ -280,7 +284,7 @@ GOAL:
 Fix ALL listed vulnerabilities in a SINGLE unified patch.
 
 Target language: ${effectiveLang}
-You MUST use only secure patterns valid for this language.
+Use only secure patterns valid for this language. Do not reference frameworks or libraries from other languages.
 
 This file contains vulnerabilities:
 ${uniqueCWEs.map(cwe => `- ${cwe}`).join("\n")}
@@ -290,6 +294,8 @@ ${AGENT_CONTRACT.constraints.join("\n")}
 
 STRICT REQUIREMENTS:
 - Eliminate ALL vulnerabilities listed above
+- Change ONLY the lines that contain the vulnerability. Do not rewrite, reformat, or restructure any other code.
+- Your patch should modify no more than 5-10 lines. If your fix requires changing more than 30% of the file, produce a smaller, targeted fix instead.
 - Do NOT partially fix
 - Do NOT remove business logic
 - Do NOT hardcode values
@@ -2013,6 +2019,7 @@ export default {
           classification.summary,
           env.VECTOR_INDEX,
           env,
+          target_language,
         );
       } catch (e) {
         console.log("RAG failed, using fallback");
@@ -2083,15 +2090,16 @@ export default {
       // ── Multi-CWE aggregation — L2 anchored, detection-enriched ──────────
       if (!classification?.cwe_id) throw new Error("MISSING_PRIMARY_CWE");
       const primaryCWE = classification.cwe_id;
-      // Derive secondary CWEs from the detection hint (single source in PoC; array-ready for v2)
-      const detected_issues: Array<{ cwe_id?: string }> = ds_detection?.cwe_hint
-        ? [{ cwe_id: ds_detection.cwe_hint }]
-        : [];
-      const secondaryCWEs = (Array.isArray(detected_issues) ? detected_issues : [])
+      // Prefer richer detected_issues array from CI (Task 5); fall back to single ds_detection hint
+      const detected_issues: Array<{ cwe_id?: string }> =
+        Array.isArray(body.detected_issues) && body.detected_issues.length > 0
+          ? body.detected_issues
+          : (ds_detection?.cwe_hint ? [{ cwe_id: ds_detection.cwe_hint }] : []);
+      const secondaryCWEs = detected_issues
         .map((i) => i.cwe_id)
         .filter((cwe): cwe is string => !!cwe && cwe !== primaryCWE);
       const uniqueCWEs = [primaryCWE, ...new Set(secondaryCWEs)].slice(0, 3);
-      console.log("Multi-CWE remediation targeting:", uniqueCWEs);
+      console.log(JSON.stringify({ event: "multi_cwe_aggregation", primaryCWE, uniqueCWEs, source: Array.isArray(body.detected_issues) && body.detected_issues.length > 0 ? "detected_issues" : "ds_detection_hint" }));
 
       // ── Step 4: Remediation ───────────────────────────────────────────────
       pipelineStep = "remediation";
@@ -2155,16 +2163,42 @@ export default {
       // Never trust LLM output or patch existence to set "fixed".
       let patch_guard_allowed = false;
       let tierA_passed = false;
-      // Pre-populated with safe defaults so downstream reads never see undefined/0 from
-      // a missing scoring pass (e.g. remediation.status === "cannot_fix" early exit).
+      // ── Pre-gate scoring — vulnerability severity, independent of patch viability ─
+      // Runs on EVERY code path (cannot_fix, patch-guard blocked, judge reject, PR).
+      // patchRisk and judgePenalty are unknown here so default to 0.
+      // The guard.allowed path re-freezes scorePayload with the full penalised values.
+      const laneWeightMap: Record<number, number> = { 1: 0, 2: 5, 3: 10, 4: 20 };
+      const laneWeight = laneWeightMap[classification.lane] ?? 20;
+
+      const DETECTION_CONFIDENCE_BASELINE = 0.7;
+      let mismatchPenalty = 0;
+      if (cwe_mismatch) {
+        const delta = Math.abs(classification.confidence - DETECTION_CONFIDENCE_BASELINE);
+        if (delta < 0.2)       mismatchPenalty = 5;
+        else if (delta <= 0.5) mismatchPenalty = 10;
+        else                   mismatchPenalty = 15;
+      }
+
+      const { severity_base, base_score } = resolveBaseScore({
+        scanner_severity: null,
+        cwe_id:           classification.cwe_id,
+        confidence:       classification.confidence,
+      });
+      const severity_label = severity_base >= 80 ? "high" : severity_base >= 70 ? "medium" : "low";
+      console.log("CWE:", classification.cwe_id);
+      console.log("Severity Base:", severity_base);
+
+      const preGateScore = computePriorityScore(severity_base, classification.confidence, 0, 0, laneWeight, mismatchPenalty);
+
+      // Mutable until the guard.allowed path freezes it with full penalty values.
       let scorePayload = {
-        severity_base:        CWE_SEVERITY[classification.cwe_id] ?? 80,
+        severity_base,
         confidence:           classification.confidence,
         judge_penalty:        0,
         patch_risk:           0,
-        lane_weight:          0,
-        mismatch_penalty:     0,
-        final_priority_score: 0,
+        lane_weight:          laneWeight,
+        mismatch_penalty:     mismatchPenalty,
+        final_priority_score: preGateScore,
       };
 
       if (remediation.status === "cannot_fix") {
@@ -2335,11 +2369,10 @@ export default {
             }));
           }
 
-          // ── Step 5d: Final Priority Scoring (V2.0 — Severity × Confidence) ─
+          // ── Step 5d: Final Priority Scoring — add patchRisk (now known from guard) ─
           pipelineStep = "scoring";
-          const laneWeightMap: Record<number, number> = { 1: 0, 2: 5, 3: 10, 4: 20 };
-          const laneWeight = laneWeightMap[classification.lane] ?? 20;
 
+          // patchRisk is the only penalty that requires guard to have run first.
           let patchRisk: number;
           if (guard.changePercent <= 10) {
             patchRisk = 0;
@@ -2348,30 +2381,6 @@ export default {
           } else {
             patchRisk = 10;
           }
-
-          // Dynamic mismatch penalty — scaled by |llm_confidence – detection_baseline|
-          const DETECTION_CONFIDENCE_BASELINE = 0.7;
-          let mismatchPenalty = 0;
-          if (cwe_mismatch) {
-            const delta = Math.abs(classification.confidence - DETECTION_CONFIDENCE_BASELINE);
-            if (delta < 0.2)       mismatchPenalty = 5;
-            else if (delta <= 0.5) mismatchPenalty = 10;
-            else                   mismatchPenalty = 15;
-          }
-
-          // ── Fusion Score: CWE-based severity — scanner_severity passed as null (production) ─
-          // resolveBaseScore is the single source of truth; throws INVALID_BASE_SCORE on corruption.
-          const { severity_base, base_score } = resolveBaseScore({
-            scanner_severity: null,
-            cwe_id:           classification.cwe_id,
-            confidence:       classification.confidence,
-          });
-
-          console.log("CWE:", classification.cwe_id);
-          console.log("Severity Base:", severity_base);
-
-          // Derive display label from numeric severity_base for logs and PR body.
-          const severity_label = severity_base >= 80 ? "high" : severity_base >= 70 ? "medium" : "low";
 
           const finalScore = computePriorityScore(
             severity_base,
@@ -2388,8 +2397,7 @@ export default {
             throw new Error("INVALID_FINAL_SCORE");
           }
 
-          // Freeze the scoring payload immediately after calculation — prevents any downstream
-          // reassignment from corrupting the values seen in the response and assertion logs.
+          // Freeze the full penalised payload — supersedes the pre-gate scorePayload.
           scorePayload = Object.freeze({
             severity_base,
             confidence:           classification.confidence,

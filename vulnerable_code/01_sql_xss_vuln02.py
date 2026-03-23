@@ -7,6 +7,7 @@ app = Flask(__name__)
 def user():
     username = request.args.get("username")
 
+
     conn = sqlite3.connect("db.sqlite")
     cursor = conn.cursor()
 
