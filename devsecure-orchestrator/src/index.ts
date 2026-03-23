@@ -2379,6 +2379,16 @@ export default {
             patchRisk = 10;
           }
 
+          // Verification Bonus (Option C): reward confirmed judge approval with a controlled
+          // upward adjustment, capped at laneWeight so it never overrides lane routing.
+          let verificationBonus = 0;
+          if (judgeWasRun && !judgeFailure && judgeRejectReason === null) {
+            const judgeCredit = classification.confidence >= 0.85 ? 10 : 5;
+            const corroborationCredit = 5; // judge approval implies full checklist success
+            verificationBonus = Math.min(judgeCredit + corroborationCredit, laneWeight);
+            console.log(JSON.stringify({ event: "verification_bonus_awarded", bonus: verificationBonus, lane_offset: laneWeight }));
+          }
+
           const finalScore = computePriorityScore(
             severity_base,
             classification.confidence,
@@ -2386,11 +2396,11 @@ export default {
             patchRisk,
             laneWeight,
             mismatchPenalty,
-          );
+          ) + verificationBonus;
 
           // Final score integrity guard — catches NaN/Infinity from penalty arithmetic.
           if (!Number.isFinite(finalScore)) {
-            console.error(JSON.stringify({ event: "INVALID_FINAL_SCORE", severity_base, confidence: classification.confidence, judgePenalty, patchRisk, laneWeight, mismatchPenalty }));
+            console.error(JSON.stringify({ event: "INVALID_FINAL_SCORE", severity_base, confidence: classification.confidence, judgePenalty, patchRisk, laneWeight, mismatchPenalty, verificationBonus }));
             throw new Error("INVALID_FINAL_SCORE");
           }
 
@@ -2398,24 +2408,26 @@ export default {
           scorePayload = Object.freeze({
             severity_base,
             confidence:           classification.confidence,
-            judge_penalty:        judgePenalty    || 0,
-            patch_risk:           patchRisk       || 0,
-            lane_weight:          laneWeight      || 0,
-            mismatch_penalty:     mismatchPenalty || 0,
+            judge_penalty:        judgePenalty       || 0,
+            patch_risk:           patchRisk          || 0,
+            lane_weight:          laneWeight         || 0,
+            mismatch_penalty:     mismatchPenalty    || 0,
+            verification_bonus:   verificationBonus  || 0,
             final_priority_score: finalScore,
           });
 
-          console.log("FINAL SCORE DEBUG:", { cwe: classification.cwe_id, severity_base, base_score, confidence: classification.confidence, finalScore });
+          console.log("FINAL SCORE DEBUG:", { cwe: classification.cwe_id, severity_base, base_score, confidence: classification.confidence, verificationBonus, finalScore });
           console.log(JSON.stringify({
-            event:            "final_scoring",
-            cwe_id:           classification.cwe_id,
+            event:               "final_scoring",
+            cwe_id:              classification.cwe_id,
             severity_base,
-            confidence:       classification.confidence,
-            judge_penalty:    judgePenalty,
-            lane_weight:      laneWeight,
-            patch_risk:       patchRisk,
-            mismatch_penalty: mismatchPenalty,
-            final_score:      finalScore,
+            confidence:          classification.confidence,
+            judge_penalty:       judgePenalty,
+            lane_weight:         laneWeight,
+            patch_risk:          patchRisk,
+            mismatch_penalty:    mismatchPenalty,
+            verification_bonus:  verificationBonus,
+            final_score:         finalScore,
           }));
 
           t_after_gates = Date.now();

@@ -1,0 +1,6 @@
+{
+    "cve_id":  "CVE-2026-79001",
+    "file":  "03_xss_vuln01.py",
+    "cwe":  "CWE-79",
+    "severity":  70
+}
