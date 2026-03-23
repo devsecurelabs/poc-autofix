@@ -5,9 +5,9 @@ app = Flask(__name__)
 
 @app.route("/user1")
 def user():
-    username = request.args.get("username")  
+    username = request.args.get("username") 
 
-    conn = sqlite3.connect("db.sqlite")  
+    conn = sqlite3.connect("db.sqlite") 
     cursor = conn.cursor()
 
     # SQL Injection
