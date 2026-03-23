@@ -723,7 +723,7 @@ function checkPatchGuard(original: string, fixed: string): PatchGuardResult {
   // rather than percentage, because 20% of a 20-line file is only 4 lines — far too
   // restrictive for any meaningful security fix on a short file.
   const SMALL_FILE_THRESHOLD = 50;
-  const SMALL_FILE_MAX_LINES = 15;
+  const SMALL_FILE_MAX_LINES = 20;
   const MAX_PATCH_PERCENT    = 20; // percentage limit for normal files
 
   let patch_guard_mode: "percentage" | "absolute";
