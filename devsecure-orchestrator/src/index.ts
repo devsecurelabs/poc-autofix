@@ -15,6 +15,28 @@ const DEFAULT_CLASSIFIER_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct";
 const DEFAULT_REMEDIATION_MODEL = "Qwen/Qwen2.5-Coder-32B-Instruct";
 const GITHUB_API = "https://api.github.com";
 
+// Language detection map — extension → canonical language label.
+// Used for prompt injection and RAG context filtering.
+const LANGUAGE_MAP: Record<string, string> = {
+  ".js":    "javascript",
+  ".ts":    "typescript",
+  ".py":    "python",
+  ".php":   "php",
+  ".java":  "java",
+  ".cs":    "csharp",
+  ".cpp":   "cpp",
+  ".cc":    "cpp",
+  ".h":     "cpp",
+  ".rs":    "rust",
+  ".kt":    "kotlin",
+  ".swift": "swift",
+  ".scala": "scala",
+  ".sh":    "bash",
+  ".sql":   "sql",
+  ".go":    "go",
+  ".rb":    "ruby",
+};
+
 // Shared contract injected into every agent prompt — single source of behavioural truth.
 const AGENT_CONTRACT = {
   goal: "Fix EXACT CWE vulnerability with minimal change",
@@ -248,11 +270,17 @@ async function remediate(
   apiKey: string,
   env: Env,
   uniqueCWEs: string[] = [classification.cwe_id],
+  targetLanguage?: string,
 ): Promise<RemediationResult> {
+  const effectiveLang = targetLanguage || language || "unknown";
+
   const system = `You are a secure code patch generator.
 
 GOAL:
 Fix ALL listed vulnerabilities in a SINGLE unified patch.
+
+Target language: ${effectiveLang}
+You MUST use only secure patterns valid for this language.
 
 This file contains vulnerabilities:
 ${uniqueCWEs.map(cwe => `- ${cwe}`).join("\n")}
@@ -290,8 +318,8 @@ summary: ${classification.summary}
 ## RAG Context — CWE Knowledge Base (${classification.cwe_id})
 ${ragContext}
 
-## Original code to fix
-\`\`\`${language}
+## Original ${effectiveLang} code to fix
+\`\`\`${effectiveLang}
 ${code}
 \`\`\``;
 
@@ -375,12 +403,13 @@ async function remediateWithRetry(
   apiKey: string,
   env: Env,
   uniqueCWEs?: string[],
+  targetLanguage?: string,
 ): Promise<RemediationResult> {
   const MAX_ATTEMPTS = 2;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       console.log("Remediation attempt:", attempt);
-      const result = await remediate(code, language, classification, ragContext, apiKey, env, uniqueCWEs);
+      const result = await remediate(code, language, classification, ragContext, apiKey, env, uniqueCWEs, targetLanguage);
       validateRemediation(result);
       return result;
     } catch (err) {
@@ -651,6 +680,7 @@ interface PatchGuardResult {
   changedLines: number;
   changePercent: number;
   reason?: string;
+  patch_guard_mode: "percentage" | "absolute";
 }
 
 function checkPatchGuard(original: string, fixed: string): PatchGuardResult {
@@ -683,17 +713,34 @@ function checkPatchGuard(original: string, fixed: string): PatchGuardResult {
   const changePercent = originalCount > 0 ? (changedLines / originalCount) * 100 : 100;
   const sizeRatio = originalBytes > 0 ? fixedBytes / originalBytes : Infinity;
 
-  // Absolute Floor: small targeted fixes (≤ 10 changed lines) are always allowed
-  // regardless of changePercent. The 20% limit is only meaningful on larger files;
-  // on a 20-line file a 5-line security fix legitimately exceeds 20% without risk.
-  const absoluteFloor = changedLines <= 10;
+  // Small-file mode: files < 50 lines use an absolute changed-line limit (15 lines)
+  // rather than percentage, because 20% of a 20-line file is only 4 lines — far too
+  // restrictive for any meaningful security fix on a short file.
+  const SMALL_FILE_THRESHOLD = 50;
+  const SMALL_FILE_MAX_LINES = 15;
+  const MAX_PATCH_PERCENT    = 20; // percentage limit for normal files
+
+  let patch_guard_mode: "percentage" | "absolute";
+  let patchAllowed: boolean;
+
+  if (originalCount < SMALL_FILE_THRESHOLD) {
+    patch_guard_mode = "absolute";
+    patchAllowed     = changedLines <= SMALL_FILE_MAX_LINES;
+  } else {
+    patch_guard_mode = "percentage";
+    patchAllowed     = changePercent <= MAX_PATCH_PERCENT;
+  }
 
   const violations: string[] = [];
-  if (!absoluteFloor && changePercent > 20) {
-    violations.push(`${changePercent.toFixed(1)}% of lines changed (limit: 20%)`);
+  if (!patchAllowed) {
+    violations.push(
+      patch_guard_mode === "absolute"
+        ? `${changedLines} lines changed (small-file limit: ${SMALL_FILE_MAX_LINES})`
+        : `${changePercent.toFixed(1)}% of lines changed (limit: ${MAX_PATCH_PERCENT}%)`,
+    );
   }
   if (changedLines > 50) {
-    violations.push(`${changedLines} absolute lines changed (limit: 50)`);
+    violations.push(`${changedLines} absolute lines changed (hard limit: 50)`);
   }
   if (sizeRatio > 2) {
     violations.push(`file size increased ${sizeRatio.toFixed(2)}x (limit: 2x)`);
@@ -705,22 +752,23 @@ function checkPatchGuard(original: string, fixed: string): PatchGuardResult {
   const allowed = violations.length === 0;
   console.log(JSON.stringify({
     event: "patch_guard",
+    patch_guard_mode,
     originalLines: originalCount,
     fixedLines: fixedCount,
     changedLines,
     changePercent: parseFloat(changePercent.toFixed(1)),
     sizeRatio: parseFloat(sizeRatio.toFixed(2)),
-    absoluteFloor,
     allowed,
   }));
 
   return {
     allowed,
-    originalLines: originalCount,
-    fixedLines: fixedCount,
+    originalLines:   originalCount,
+    fixedLines:      fixedCount,
     changedLines,
     changePercent,
-    reason: allowed ? undefined : `Blocked by Patch Guard: ${violations.join("; ")}`,
+    patch_guard_mode,
+    reason: allowed ? undefined : `Blocked by Patch Guard (${patch_guard_mode} mode): ${violations.join("; ")}`,
   };
 }
 
@@ -1131,6 +1179,15 @@ async function ghFetch(
 // appends a comment instead of creating a duplicate.
 // Advisory content is generated inline with a hard 5-second timeout.
 // Invariant: advisory output is NEVER allowed into the PR path.
+interface IssueOptions {
+  scorePayload?:     Record<string, number | undefined>;
+  target_language?:  string;
+  patch_guard_mode?: string;
+  ghost_patch?:      string;  // unverified AI-generated fix (shown collapsed, NOT for use)
+  fix_attempted?:    boolean;
+  fix_generated?:    boolean;
+}
+
 async function openIssue(
   repo: string,
   filePath: string,
@@ -1139,15 +1196,19 @@ async function openIssue(
   pat: string,
   env: Env,
   failureType: FailureType = "infra",
+  options: IssueOptions = {},
 ): Promise<string> {
+  const fix_attempted = options.fix_attempted ?? true;
+  const fix_generated = options.fix_generated ?? false;
+
   const structuredLog = {
     event: "failure_classified",
     failure_type: failureType,
     reason: remediation.reason ?? "none",
     cwe_id: classification.cwe_id,
     lane: classification.lane,
-    fix_attempted: true,
-    fix_generated: false,
+    fix_attempted,
+    fix_generated,
   };
 
   // ── Idempotency check ───────────────────────────────────────────────────
@@ -1163,7 +1224,7 @@ async function openIssue(
       ``,
       `> ⚠️ **Not verified by DevSecure gates** | **No verified fix could be safely generated.**`,
       ``,
-      `*Duplicate suppressed — existing issue updated. fix_attempted=true | fix_generated=false*`,
+      `*Duplicate suppressed — existing issue updated. fix_attempted=${fix_attempted} | fix_generated=${fix_generated}*`,
     ].join("\n");
 
     await ghFetch(`/repos/${repo}/issues/${existing.number}/comments`, "POST", pat, { body: commentBody });
@@ -1174,32 +1235,113 @@ async function openIssue(
   // ── Advisory generation (5 s hard timeout, fail-safe) ──────────────────
   const advisory = await generateAdvisory(classification, failureType, env);
 
-  // ── Create new issue ────────────────────────────────────────────────────
-  const title = `[L4 Escalation] ${classification.cwe_id} – ${classification.cwe_name} in \`${filePath}\``;
+  // ── Investor-grade issue body ────────────────────────────────────────────
+  const safeCwe        = classification?.cwe_id   ?? "UNKNOWN";
+  const safeConfidence = classification?.confidence ?? 0;
+  const safeSummary    = classification?.summary   ?? "Automated remediation could not guarantee a safe fix without risking business logic integrity.";
+  const target_lang    = options.target_language   ?? "unknown";
+  const sp             = options.scorePayload      ?? {};
 
-  const body = [
-    `## Automated L4 Escalation — Manual Review Required`,
+  const scoreTable = [
+    `| Signal | Value |`,
+    `|--------|-------|`,
+    `| Severity Base | ${sp.severity_base ?? 0} |`,
+    `| Confidence | ${sp.confidence ?? safeConfidence} |`,
+    `| Lane Weight | -${sp.lane_weight ?? 0} |`,
+    `| Patch Risk | -${sp.patch_risk ?? 0} |`,
+    `| Mismatch Penalty | -${sp.mismatch_penalty ?? 0} |`,
+    `| **Final Score** | **${sp.final_priority_score ?? 0}** |`,
+  ].join("\n");
+
+  const bodyParts: string[] = [
+    `## ⚠️ DevSecure L4 Escalation — Manual Review Required`,
     ``,
-    `> ⚠️ **Not verified by DevSecure gates** | **No verified fix could be safely generated.**`,
+    `> ⚠️ **Not verified by DevSecure gates**`,
+    `> No verified fix could be safely generated.`,
     ``,
-    `| Field | Value |`,
-    `|---|---|`,
-    `| **File** | \`${filePath}\` |`,
-    `| **CWE** | ${classification.cwe_id} — ${classification.cwe_name} |`,
-    `| **Confidence** | ${(classification.confidence * 100).toFixed(1)}% |`,
-    `| **Routing Lane** | L${classification.lane} |`,
-    `| **Failure Classification** | \`${failureType}\` |`,
+    `---`,
     ``,
-    `### Failure Context`,
-    `${remediation.reason ?? "No reason provided."}`,
+    `### 📄 File`,
+    `\`${filePath}\``,
+    ``,
+    `### 🔐 Vulnerability`,
+    `**${safeCwe}** — ${classification?.cwe_name ?? ""}`,
+    ``,
+    `### 🔍 Detection Confidence`,
+    `${Math.round(safeConfidence * 100)}%  |  Routing Lane: L${classification?.lane ?? "?"}  |  Failure Class: \`${failureType}\``,
+    ``,
+    `---`,
+    ``,
+    `### ❌ Why Auto-Fix Failed`,
+    ``,
+    `The AI-generated fix did not pass deterministic validation:`,
+    `- **Blocked by:** ${remediation.reason ?? "validation constraints"}`,
+    `- **Patch Guard mode:** ${options.patch_guard_mode ?? "unknown"}`,
+    ``,
+    `---`,
+    ``,
+    `### 🧠 DevSecure Insight`,
+    ``,
+    safeSummary,
+    ``,
+    `---`,
+    ``,
+    `### 💡 Recommended Remediation`,
+    ``,
+    `- Review the targeted vulnerability: **${safeCwe}**`,
+    `- Implement secure coding patterns appropriate for **${target_lang}**`,
+    ``,
+    `---`,
+    ``,
+    `### 📊 Priority Score Breakdown`,
+    ``,
+    scoreTable,
+    ``,
+    `---`,
+    ``,
+    `### 🔁 System Outcome`,
+    ``,
+    `Fix attempted: ${fix_attempted}`,
+    `Fix generated: ${fix_generated}`,
+    ``,
+    `---`,
     ``,
     `### Root Cause & Remediation Strategy`,
     `${advisory}`,
+  ];
+
+  // ── Ghost Patch (Task 4) — collapsed, clearly marked unverified ─────────
+  if (options.ghost_patch && options.ghost_patch.trim().length > 0) {
+    bodyParts.push(
+      ``,
+      `---`,
+      ``,
+      `### ⚠️ Unverified AI Patch (For Reference Only)`,
+      ``,
+      `<details>`,
+      `<summary>View AI-generated patch (NOT VERIFIED — DO NOT USE DIRECTLY)</summary>`,
+      ``,
+      `> ⚠️ This patch was **BLOCKED** by DevSecure gates and has NOT passed deterministic verification.`,
+      ``,
+      `**Blocked by:** ${remediation.reason ?? "validation constraints"}`,
+      ``,
+      `\`\`\`${target_lang}`,
+      options.ghost_patch,
+      `\`\`\``,
+      ``,
+      `</details>`,
+    );
+  }
+
+  bodyParts.push(
     ``,
     `---`,
     `*Generated by **devsecure-orchestrator**. Assign to a senior engineer for manual remediation.*`,
-    `*fix_attempted=true | fix_generated=false*`,
-  ].join("\n");
+    `*fix_attempted=${fix_attempted} | fix_generated=${fix_generated}*`,
+  );
+
+  const title = `[L4 Escalation] ${safeCwe} – ${classification?.cwe_name ?? ""} in \`${filePath}\``;
+  const body  = bodyParts.join("\n");
 
   const res = await ghFetch(`/repos/${repo}/issues`, "POST", pat, {
     title,
@@ -1276,6 +1418,7 @@ async function openPr(
   scannerSeverity: string = "unknown",
   priorityScore: number = 0,
   complexity: ComplexityProfile = analyseComplexity(filePath),
+  scorePayload?: Record<string, number | undefined>,
 ): Promise<string> {
   // 1. Resolve base branch HEAD SHA
   const refRes = await ghFetch(
@@ -1421,6 +1564,33 @@ ${classification.summary}
 ${complexity.tier === "enterprise" ? "- [ ] Senior engineer sign-off (CCN > 20 mandate)\n- [ ] Taint propagation paths manually verified" : ""}
 
 > ⚠️ **AI models have zero approval authority.** A human reviewer must approve and merge this PR.
+
+---
+
+### 📊 Priority Score Breakdown
+
+| Signal | Value |
+|--------|-------|
+| Severity Base | ${scorePayload?.severity_base ?? 0} |
+| Confidence | ${scorePayload?.confidence ?? classification.confidence} |
+| Lane Weight | -${scorePayload?.lane_weight ?? 0} |
+| Patch Risk | -${scorePayload?.patch_risk ?? 0} |
+| Mismatch Penalty | -${scorePayload?.mismatch_penalty ?? 0} |
+| **Final Score** | **${scorePayload?.final_priority_score ?? priorityScore}** |
+
+---
+
+### 🔍 Verification Evidence (Pending)
+
+<details>
+<summary>Tier B Validation Status</summary>
+
+- **Targeted Vulnerability:** ${classification.cwe_id}
+- **Status:** ⚠️ PoC Mode — Tier B validation deferred to CI pipeline.
+- Full deterministic gate verification is pending GitHub Actions completion.
+- **Do NOT merge until all CI checks pass.**
+
+</details>
 
 *Generated by **devsecure-orchestrator** · Complexity Engine v1 · Ledger: \`${LEDGER_PATH}\`*`,
       head: fixBranch,
@@ -1790,12 +1960,27 @@ export default {
     };
 
     let pipelineStep = "init";
-    const start = Date.now();
+    // ── Target language: prefer code_context.language, fall back to file extension ─
+    const extractFilename = file_path || "unknown.txt";
+    const ext = extractFilename.includes(".")
+      ? extractFilename.substring(extractFilename.lastIndexOf("."))
+      : "";
+    const target_language = LANGUAGE_MAP[ext] ?? language ?? "unknown";
+    console.log("Target Language:", target_language);
+
+    const t_start = Date.now();
+    const start   = t_start; // alias preserved for existing duration logging
+    // Timing markers — set between stages; default to t_start so arithmetic is always safe.
+    let t_after_class = t_start;
+    let t_after_rag   = t_start;
+    let t_after_remed = t_start;
+    let t_after_gates = t_start;
     try {
       // ── Step 1: Classification (Qwen2.5) ──────────────────────────────────
       pipelineStep = "classification";
       const classification = await classify(code, language, env.HF_API_KEY, env);
       console.log("Classification result:", JSON.stringify(classification));
+      t_after_class = Date.now();
 
       // ── ds_detection mismatch: hint exists and differs from LLM-derived CWE ─
       const cwe_mismatch = !!(
@@ -1834,6 +2019,7 @@ export default {
         ragContext = "No RAG context available.";
       }
       console.log("RAG context length:", ragContext.length);
+      t_after_rag = Date.now();
 
       // ── Step 3: Confidence gate (fail-closed) ─────────────────────────────
       pipelineStep = "confidence_gate";
@@ -1917,7 +2103,7 @@ export default {
         // We monkey-patch by catching attempt-1 failure at this level without re-running.
         let attempt1Succeeded = false;
         try {
-          const result1 = await remediate(code, language, classification, ragContext, env.HF_API_KEY, env, uniqueCWEs);
+          const result1 = await remediate(code, language, classification, ragContext, env.HF_API_KEY, env, uniqueCWEs, target_language);
           validateRemediation(result1);
           remediation = result1;
           attempt1Succeeded = true;
@@ -1925,7 +2111,7 @@ export default {
           remediationRequiredRetry = true;
         }
         if (!attempt1Succeeded) {
-          remediation = await remediateWithRetry(code, language, classification, ragContext, env.HF_API_KEY, env, uniqueCWEs);
+          remediation = await remediateWithRetry(code, language, classification, ragContext, env.HF_API_KEY, env, uniqueCWEs, target_language);
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1952,6 +2138,7 @@ export default {
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
+      t_after_remed = Date.now();
       if (remediation.status === "fixed") {
         const patchLen = (remediation.fixed_code ?? remediation.search_replace_block ?? "").length;
         console.log(JSON.stringify({ event: "remediation_received", status: "fixed", patch_length: patchLen }));
@@ -2064,6 +2251,7 @@ export default {
             env.GITHUB_PAT,
             env,
             "policy",
+            { target_language, patch_guard_mode: guard.patch_guard_mode, fix_attempted: true, fix_generated: true, ghost_patch: remediation.fixed_code },
           );
           action = "issue_escalated";
           // patch_guard_allowed stays false — deterministic gate remains closed
@@ -2225,6 +2413,8 @@ export default {
             final_score:      finalScore,
           }));
 
+          t_after_gates = Date.now();
+
           // ── Step 5e: Decision engine ──────────────────────────────────────
           pipelineStep = "github";
 
@@ -2242,6 +2432,7 @@ export default {
               env.GITHUB_PAT,
               env,
               judgeFailure ? "infra" : "policy",
+              { scorePayload, target_language, patch_guard_mode: guard.patch_guard_mode, fix_attempted: true, fix_generated: true, ghost_patch: remediation.fixed_code },
             );
             action = "issue_escalated";
           } else if (finalScore >= 70) {
@@ -2249,7 +2440,7 @@ export default {
             tierA_passed = true; // gate 2 of 2 cleared: score threshold met, no judge block
             const complexity = analyseComplexity(file_path);
             console.log(JSON.stringify({ event: "complexity_analysis", tier: complexity.tier, ccn: complexity.ccn, fan_in: complexity.fan_in, taint_risk: complexity.taint_risk, action: complexity.action, file_path }));
-            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT, severity_label, finalScore, complexity);
+            githubUrl = await openPr(repo, file_path, decoded, classification, base_branch, env.GITHUB_PAT, severity_label, finalScore, complexity, scorePayload);
             action = "pr_ready";
             console.log(JSON.stringify({ event: "pr_created", cwe_id: classification.cwe_id, lane: classification.lane, final_score: finalScore, severity_base, severity_label, tier: complexity.tier, pr_label: complexity.pr_label, fix_attempted: true, fix_generated: true }));
           } else {
@@ -2260,6 +2451,7 @@ export default {
               env.GITHUB_PAT,
               env,
               "policy",
+              { scorePayload, target_language, patch_guard_mode: guard.patch_guard_mode, fix_attempted: true, fix_generated: true, ghost_patch: remediation.fixed_code },
             );
             action = "issue_escalated";
             console.log(JSON.stringify({ event: "score_gate_blocked", final_score: finalScore, severity_base, confidence: classification.confidence }));
@@ -2349,6 +2541,21 @@ export default {
         await emitDecision("routing_integrity", "violation", errorContext, classification, scorePayload.final_priority_score, true);
         throw new Error(`ROUTING_INTEGRITY_VIOLATION: ${errorContext}`);
       }
+
+      const t_end = Date.now();
+      // ── Pipeline timing telemetry (Task 6) ────────────────────────────────
+      // Markers default to t_start when a stage is short-circuited (early exit),
+      // so all deltas are always non-negative and arithmetic is always safe.
+      console.log(JSON.stringify({
+        event:             "pipeline_timing",
+        target_language,
+        classification_ms: t_after_class - t_start,
+        rag_ms:            t_after_rag   - t_after_class,
+        remediation_ms:    t_after_remed - t_after_rag,
+        validation_ms:     t_after_gates - t_after_remed,
+        github_ms:         t_end         - t_after_gates,
+        total_ms:          t_end         - t_start,
+      }));
 
       await emitDecision(
         action === "issue_escalated" ? "decision" : "pr_created",
