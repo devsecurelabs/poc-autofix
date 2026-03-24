@@ -7,6 +7,7 @@ import { getEmbedding } from "./embed";
 import { seedCWEData } from "./seed-data";
 import type { Env } from "./env";
 import { emitEvent } from "./telemetry";
+import { RESEARCH_CONFIG } from "./research_target";
 
 // HF Inference Router — primary 2026 endpoint; model dispatched via body "model" field
 const HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions";
@@ -719,11 +720,11 @@ function checkPatchGuard(original: string, fixed: string): PatchGuardResult {
   const changePercent = originalCount > 0 ? (changedLines / originalCount) * 100 : 100;
   const sizeRatio = originalBytes > 0 ? fixedBytes / originalBytes : Infinity;
 
-  // Small-file mode: files < 50 lines use an absolute changed-line limit (15 lines)
-  // rather than percentage, because 20% of a 20-line file is only 4 lines — far too
-  // restrictive for any meaningful security fix on a short file.
+  // Small-file mode: files < 50 lines use an absolute changed-line limit rather than
+  // percentage, because 20% of a 20-line file is only 4 lines — far too restrictive
+  // for any meaningful security fix on a short file.
   const SMALL_FILE_THRESHOLD = 50;
-  const SMALL_FILE_MAX_LINES = 20;
+  const SMALL_FILE_MAX_LINES = RESEARCH_CONFIG.SMALL_FILE_MAX_LINES;
   const MAX_PATCH_PERCENT    = 20; // percentage limit for normal files
 
   let patch_guard_mode: "percentage" | "absolute";
@@ -794,48 +795,8 @@ const COMPLEX_CWES = ["CWE-89", "CWE-78", "CWE-22", "CWE-79", "CWE-94"];
 // CWE-based severity map — Fusion Score core.
 // Scoring is derived purely from vulnerability class, not external detection signals.
 // Fail-closed default: 80 (HIGH) for any unrecognised CWE.
-const CWE_SEVERITY: Record<string, number> = {
-  // ── Injection / RCE (Critical) ───────────────────────────────────────────
-  "CWE-78":  90,  // OS Command Injection
-  "CWE-89":  90,  // SQL Injection
-  "CWE-77":  90,  // Command Injection (generic)
-  "CWE-94":  85,  // Code Injection
-  "CWE-502": 90,  // Deserialization of Untrusted Data
-  "CWE-20":  80,  // Improper Input Validation
-
-  // ── Authentication / Access Control (High) ──────────────────────────────
-  "CWE-287": 85,  // Improper Authentication
-  "CWE-284": 80,  // Improper Access Control
-  "CWE-862": 85,  // Missing Authorization
-  "CWE-269": 85,  // Improper Privilege Management
-  "CWE-522": 80,  // Insufficiently Protected Credentials
-
-  // ── Sensitive Data Exposure (Medium-High) ───────────────────────────────
-  "CWE-200": 75,  // Exposure of Sensitive Information
-  "CWE-319": 75,  // Cleartext Transmission of Sensitive Data
-  "CWE-327": 75,  // Use of Broken/Risky Cryptographic Algorithm
-  "CWE-326": 75,  // Inadequate Encryption Strength
-
-  // ── Client-Side / Web (Medium) ──────────────────────────────────────────
-  "CWE-79":  70,  // Cross-Site Scripting (XSS)
-  "CWE-352": 70,  // Cross-Site Request Forgery (CSRF)
-  "CWE-601": 65,  // Open Redirect
-
-  // ── File / Path (High) ──────────────────────────────────────────────────
-  "CWE-22":  80,  // Path Traversal
-  "CWE-434": 80,  // Unrestricted File Upload
-  "CWE-73":  75,  // External Control of File Name or Path
-
-  // ── Resource / Memory (Medium) ──────────────────────────────────────────
-  "CWE-400": 65,  // Uncontrolled Resource Consumption
-  "CWE-476": 60,  // NULL Pointer Dereference
-  "CWE-787": 85,  // Out-of-bounds Write
-
-  // ── Configuration / Info Disclosure (Low-Medium) ────────────────────────
-  "CWE-16":  60,  // Configuration
-  "CWE-209": 60,  // Error Message Information Exposure
-  "CWE-215": 60,  // Information Exposure Through Debug Info
-};
+// Source of truth lives in research_target.ts — do not duplicate values here.
+const CWE_SEVERITY = RESEARCH_CONFIG.CWE_SEVERITY;
 
 // Compute the final priority score from CWE-derived severity_base and L2 LLM confidence,
 // then subtract pipeline penalties applied upstream (judge, patch risk, etc.).
@@ -2167,8 +2128,8 @@ export default {
       // Runs on EVERY code path (cannot_fix, patch-guard blocked, judge reject, PR).
       // patchRisk and judgePenalty are unknown here so default to 0.
       // The guard.allowed path re-freezes scorePayload with the full penalised values.
-      const laneWeightMap: Record<number, number> = { 1: 0, 2: 5, 3: 10, 4: 20 };
-      const laneWeight = laneWeightMap[classification.lane] ?? 20;
+      const laneWeightMap = RESEARCH_CONFIG.LANE_WEIGHTS;
+      const laneWeight = (laneWeightMap as Record<number, number>)[classification.lane] ?? 20;
 
       const DETECTION_CONFIDENCE_BASELINE = 0.7;
       let mismatchPenalty = 0;
@@ -2370,21 +2331,18 @@ export default {
           pipelineStep = "scoring";
 
           // patchRisk is the only penalty that requires guard to have run first.
-          let patchRisk: number;
-          if (guard.changePercent <= 10) {
-            patchRisk = 0;
-          } else if (guard.changePercent <= 15) {
-            patchRisk = 5;
-          } else {
-            patchRisk = 10;
-          }
+          const patchRiskBracket = RESEARCH_CONFIG.PATCH_RISK_BRACKETS.find(
+            (b) => guard.changePercent <= b.maxPercent,
+          );
+          const patchRisk = patchRiskBracket?.penalty ?? 10;
 
           // Verification Bonus (Option C): reward confirmed judge approval with a controlled
           // upward adjustment, capped at laneWeight so it never overrides lane routing.
           let verificationBonus = 0;
           if (judgeWasRun && !judgeFailure && judgeRejectReason === null) {
-            const judgeCredit = classification.confidence >= 0.85 ? 10 : 5;
-            const corroborationCredit = 5; // judge approval implies full checklist success
+            const { HIGH_CONFIDENCE_CREDIT, LOW_CONFIDENCE_CREDIT, CORROBORATION_CREDIT } = RESEARCH_CONFIG.VERIFICATION_BONUS;
+            const judgeCredit = classification.confidence >= 0.85 ? HIGH_CONFIDENCE_CREDIT : LOW_CONFIDENCE_CREDIT;
+            const corroborationCredit = CORROBORATION_CREDIT;
             verificationBonus = Math.min(judgeCredit + corroborationCredit, laneWeight);
             console.log(JSON.stringify({ event: "verification_bonus_awarded", bonus: verificationBonus, lane_offset: laneWeight }));
           }
@@ -2452,7 +2410,7 @@ export default {
               { scorePayload, target_language, patch_guard_mode: guard.patch_guard_mode, fix_attempted: true, fix_generated: true, ghost_patch: remediation.fixed_code },
             );
             action = "issue_escalated";
-          } else if (finalScore >= 70) {
+          } else if (finalScore >= RESEARCH_CONFIG.AUTO_MERGE_THRESHOLD) {
             // Both deterministic gates passed — safe to mark as fixed and open PR
             tierA_passed = true; // gate 2 of 2 cleared: score threshold met, no judge block
             const complexity = analyseComplexity(file_path);
@@ -2535,7 +2493,7 @@ export default {
         throw new Error("INVALID_STATE_INPUT: action or remediation_status is undefined");
       }
 
-      const isHighRisk      = scorePayload.final_priority_score >= 70;
+      const isHighRisk      = scorePayload.final_priority_score >= RESEARCH_CONFIG.AUTO_MERGE_THRESHOLD;
       const isEscalated     = action === "issue_escalated";
       const isFixSuccessful = remediation_status === "fixed";
       const isPRReady       = action === "pr_ready" || action === "pr_opened";
