@@ -2,7 +2,7 @@
 // seed.ts — Populates the cwe-knowledge-base Vectorize index with CWE remediation guidance.
 // Trigger via GET /seed on the deployed Worker (one-shot, idempotent).
 
-import { hfEmbed } from "./embed";
+import { getEmbedding } from "./embed";
 import type { Env } from "./env";
 
 // ---------------------------------------------------------------------------
@@ -154,7 +154,7 @@ export async function seed(env: Env): Promise<{ seeded: number; ids: string[] }>
 
   for (const entry of CWE_DATA) {
     // Embed the prescriptive remediation text (768-dim via bge-base-en-v1.5)
-    const vector = await hfEmbed(entry.text, env.HF_API_KEY);
+    const vector = await getEmbedding(entry.text, env);
 
     await env.VECTOR_INDEX.upsert([
       {

@@ -744,7 +744,6 @@ const COMPLEX_CWES = ["CWE-89", "CWE-78", "CWE-22", "CWE-79", "CWE-94"];
 // Scoring is derived purely from vulnerability class, not external detection signals.
 // Fail-closed default: 80 (HIGH) for any unrecognised CWE.
 // Source of truth lives in research_target.ts — do not duplicate values here.
-const CWE_SEVERITY = RESEARCH_CONFIG.CWE_SEVERITY;
 
 // Compute the final priority score from CWE-derived severity_base and L2 LLM confidence,
 // then subtract pipeline penalties applied upstream (judge, patch risk, etc.).
@@ -1790,6 +1789,7 @@ export default {
       source_type: ds_detection?.type ?? "unknown",
       cwe_hint:    ds_detection?.cwe_hint,
     };
+    void hsl; // retained for future auditing; internal-only, never serialised
 
     if (!code || !language) {
       return new Response(
@@ -2013,7 +2013,7 @@ export default {
       // ── Step 4: Remediation ───────────────────────────────────────────────
       pipelineStep = "remediation";
       console.log("Calling remediation model: " + (env.REMEDIATION_MODEL || DEFAULT_REMEDIATION_MODEL));
-      let remediation: RemediationResult;
+      let remediation: RemediationResult = { status: "cannot_fix", reason: "Remediation not yet attempted" };
       let remediationRequiredRetry = false;
       try {
         // Wrap remediateWithRetry to detect if attempt 1 failed and attempt 2 was needed.
@@ -2066,7 +2066,7 @@ export default {
       // ── Step 5: Fail-closed gate + Patch Guard ────────────────────────────
       pipelineStep = "github";
       let githubUrl: string;
-      let action: "pr_opened" | "pr_ready" | "issue_escalated";
+      let action: "pr_opened" | "pr_ready" | "issue_escalated" | "auto_merged";
       let judgeWasRun = false;
       // Deterministic gate flags — remediation_status is derived ONLY from these two.
       // Never trust LLM output or patch existence to set "fixed".
@@ -2115,7 +2115,7 @@ export default {
           githubUrl = await openIssue(
               repo, file_path, classification, remediation,
               env.GITHUB_PAT, env, "model",
-              { scorePayload: preGateScore, target_language }
+              { scorePayload: { final_priority_score: preGateScore }, target_language }
           );
 
         action = "issue_escalated";
@@ -2226,11 +2226,13 @@ export default {
               judgeWasRun = true;
               console.log("Enforcing Agent Contract for:", classification.cwe_id);
               const judgeResult = await judgeReview(code, decoded, uniqueCWEs, classification, env);
+              // judgeReview always normalises issues to string[] before returning
+              const judgeIssues = judgeResult.issues as string[];
 
               // Strict mode when cwe_mismatch: require explicit approve + confidence >= 0.85 + no issues
               const effectiveReject = cwe_mismatch
-                ? (judgeResult.verdict !== "approve" || judgeResult.confidence < 0.85 || judgeResult.issues.length > 0)
-                : (judgeResult.verdict === "reject" || judgeResult.confidence < 0.80 || judgeResult.issues.length > 0);
+                ? (judgeResult.verdict !== "approve" || judgeResult.confidence < 0.85 || judgeIssues.length > 0)
+                : (judgeResult.verdict === "reject" || judgeResult.confidence < 0.80 || judgeIssues.length > 0);
 
               // Judge penalty: verdict-based + confidence gap + issue count (capped at 15)
               if (judgeResult.verdict === "reject") {
@@ -2238,27 +2240,27 @@ export default {
               } else if (judgeResult.confidence < 0.85) {
                 judgePenalty += 10;
               }
-              if (judgeResult.issues.length > 0) {
-                judgePenalty += Math.min(judgeResult.issues.length * 5, 15);
+              if (judgeIssues.length > 0) {
+                judgePenalty += Math.min(judgeIssues.length * 5, 15);
               }
 
               // Explainability factors from judge output
               if (judgeResult.verdict === "reject")  explainabilityFactors.push("judge_reject");
-              if (judgeResult.issues.length > 0)     explainabilityFactors.push("judge_issues");
+              if (judgeIssues.length > 0)            explainabilityFactors.push("judge_issues");
 
               console.log(JSON.stringify({
                 event: effectiveReject ? "[JUDGE] verdict: reject" : "[JUDGE] verdict: approve",
                 verdict: judgeResult.verdict,
                 confidence: judgeResult.confidence,
-                issueCount: judgeResult.issues.length,
-                issues: judgeResult.issues,
+                issueCount: judgeIssues.length,
+                issues: judgeIssues,
                 reason: judgeResult.reason,
                 judgePenalty,
                 effectiveReject,
               }));
 
               if (effectiveReject) {
-                judgeRejectReason = `Diversity Judge rejected fix (verdict=${judgeResult.verdict}, confidence=${judgeResult.confidence}): ${judgeResult.reason}${judgeResult.issues.length > 0 ? " Issues: " + judgeResult.issues.join("; ") : ""}`;
+                judgeRejectReason = `Diversity Judge rejected fix (verdict=${judgeResult.verdict}, confidence=${judgeResult.confidence}): ${judgeResult.reason}${judgeIssues.length > 0 ? " Issues: " + judgeIssues.join("; ") : ""}`;
               }
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
@@ -2383,7 +2385,7 @@ export default {
           // Update in-memory metrics (scoring path — has rpsScore + finalScore)
           metrics_total_requests++;
           if (cwe_mismatch) metrics_mismatch_count++;
-          if (action === "pr_opened" || action === "pr_ready") metrics_pr_opened_count++;
+          if ((action as string) === "pr_opened" || action === "pr_ready") metrics_pr_opened_count++;
           else metrics_issue_escalated_count++;
           metrics_total_final_score += finalScore;
           recent_decisions.push({ timestamp: new Date().toISOString(), repo, final_score: finalScore, decision: action });
@@ -2412,7 +2414,7 @@ export default {
       if (Object.keys(scorePayload).length === 0 && action === "issue_escalated") {
         metrics_total_requests++;
         if (cwe_mismatch) metrics_mismatch_count++;
-        if (action === "pr_opened" || action === "pr_ready") metrics_pr_opened_count++;
+        if ((action as string) === "pr_opened" || (action as string) === "pr_ready") metrics_pr_opened_count++;
         else metrics_issue_escalated_count++;
         recent_decisions.push({ timestamp: new Date().toISOString(), repo, final_score: 0, decision: action });
         if (recent_decisions.length > 10) recent_decisions.shift();
@@ -2444,8 +2446,8 @@ export default {
       const isHighRisk      = scorePayload.final_priority_score >= RESEARCH_CONFIG.AUTO_MERGE_THRESHOLD;
       const isEscalated     = action === "issue_escalated";
       const isFixSuccessful = remediation_status === "fixed";
-      const isPRReady       = action === "pr_ready" || action === "pr_opened";
-      const isAutoMerged    = action === "auto_merged";
+      const isPRReady       = action === "pr_ready" || (action as string) === "pr_opened";
+      const isAutoMerged    = (action as string) === "auto_merged";
 
       // NOTE: isHighRisk && isFixSuccessful && isPRReady is the EXPECTED valid path for Enterprise Manual Review.
 

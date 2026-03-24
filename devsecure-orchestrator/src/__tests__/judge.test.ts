@@ -1,7 +1,7 @@
 // Author: Jeremy Quadri
 // src/__tests__/judge.test.ts — Unit tests for the Adversarial Judge (Requirement 9).
 
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { judgeEvaluationSchema } from "../types";
 import type { JudgeEvaluation, JudgeEvaluationInput } from "../types";
 import { routeJudgeResult, evaluateWithJudge } from "../index";
