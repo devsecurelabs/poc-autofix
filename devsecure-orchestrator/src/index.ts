@@ -8,6 +8,7 @@ import { seedCWEData } from "./seed-data";
 import type { Env } from "./env";
 import { emitEvent } from "./telemetry";
 import { RESEARCH_CONFIG } from "./research_target";
+import { CLASSIFY_SYSTEM_PROMPT, buildRemediatePrompt } from "./prompts_target";
 
 // HF Inference Router — primary 2026 endpoint; model dispatched via body "model" field
 const HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions";
@@ -160,32 +161,7 @@ async function classify(
   apiKey: string,
   env: Env,
 ): Promise<ClassificationResult> {
-  const system = `You are a security classifier.
-
-Identify the primary CWE vulnerability.
-
-Output STRICT JSON:
-{
-  "cwe_id": "CWE-XXX",
-  "cwe_name": "Name of CWE",
-  "confidence": 0.0,
-  "lane": 1,
-  "summary": "short explanation"
-}
-
-RULES:
-- No extra text
-- Must return exactly one CWE
-- All fields mandatory
-- No markdown code fences
-
-Lane assignment:
-  1 — Trivial: single-line sanitiser call or constant swap
-  2 — Localised: logic change within one function
-  3 — Moderate: multi-function refactor required
-  4 — Architectural or cannot assess
-
-If classification is not possible return: {"cwe_id":"UNKNOWN","cwe_name":"Unknown","confidence":0,"lane":4,"summary":"Unable to classify"}`;
+  const system = CLASSIFY_SYSTEM_PROMPT;
 
   const user = `Language: ${language}\n\nVulnerable code:\n\`\`\`${language}\n${code}\n\`\`\``;
 
@@ -279,44 +255,7 @@ async function remediate(
 ): Promise<RemediationResult> {
   const effectiveLang = targetLanguage || language || "unknown";
 
-  const system = `You are a secure code patch generator.
-
-GOAL:
-Fix ALL listed vulnerabilities in a SINGLE unified patch.
-
-Target language: ${effectiveLang}
-Use only secure patterns valid for this language. Do not reference frameworks or libraries from other languages.
-
-This file contains vulnerabilities:
-${uniqueCWEs.map(cwe => `- ${cwe}`).join("\n")}
-
-Constraints:
-${AGENT_CONTRACT.constraints.join("\n")}
-
-STRICT REQUIREMENTS:
-- Eliminate ALL vulnerabilities listed above
-- Change ONLY the lines that contain the vulnerability. Do not rewrite, reformat, or restructure any other code.
-- Your patch should modify no more than 5-10 lines. If your fix requires changing more than 30% of the file, produce a smaller, targeted fix instead.
-- Do NOT partially fix
-- Do NOT remove business logic
-- Do NOT hardcode values
-- Do NOT introduce regressions
-- Do not change function signatures
-- Do not introduce new dependencies
-- Preserve all original comments, variable names, and indentation
-- Return the complete file in fixed_code — not a diff, not a partial snippet
-
-Output STRICT JSON only. No markdown. No prose outside the JSON.
-{
-  "fixed_code": "<full updated file>",
-  "explanation": "<brief summary>"
-}
-
-If you cannot fix the vulnerabilities:
-{
-  "fixed_code": "",
-  "explanation": "<reason why a fix cannot be safely generated>"
-}`;
+  const system = buildRemediatePrompt(effectiveLang, uniqueCWEs, AGENT_CONTRACT.constraints);
 
   const user = `## Vulnerabilities to fix
 ${uniqueCWEs.map(cwe => `- ${cwe}`).join("\n")}

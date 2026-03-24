@@ -1,0 +1,313 @@
+{
+  "version": "1.0.0",
+  "description": "DevSecure eval corpus — 30 vulnerable code samples across 5 CWEs",
+  "cwe_coverage": ["CWE-89", "CWE-79", "CWE-22", "CWE-78", "CWE-287"],
+  "splits": {
+    "train": 20,
+    "holdout": 10
+  },
+  "vulnerable_code": [
+    {
+      "id": "vc-01",
+      "file": "vulnerable_code/01_sql_inj_vuln01.py",
+      "cwe": "CWE-89",
+      "cwe_name": "SQL Injection",
+      "language": "python",
+      "framework": "flask",
+      "expected_detection": true,
+      "vulnerability_summary": "String concatenation of request parameter into raw SQL query"
+    },
+    {
+      "id": "vc-02",
+      "file": "vulnerable_code/sample7.py",
+      "cwe": "CWE-89",
+      "cwe_name": "SQL Injection",
+      "language": "python",
+      "framework": "flask",
+      "expected_detection": true,
+      "vulnerability_summary": "f-string interpolation of user input into SQL WHERE clause"
+    },
+    {
+      "id": "vc-03",
+      "file": "vulnerable_code/java/UserController.java",
+      "cwe": "CWE-89",
+      "cwe_name": "SQL Injection",
+      "language": "java",
+      "framework": "spring",
+      "expected_detection": true,
+      "vulnerability_summary": "String concatenation in Spring JdbcTemplate query"
+    },
+    {
+      "id": "vc-04",
+      "file": "vulnerable_code/php/db.php",
+      "cwe": "CWE-89",
+      "cwe_name": "SQL Injection",
+      "language": "php",
+      "framework": "none",
+      "expected_detection": true,
+      "vulnerability_summary": "Direct concatenation of $_GET parameter into mysqli query"
+    },
+    {
+      "id": "vc-05",
+      "file": "vulnerable_code/03_xss_vuln01.py",
+      "cwe": "CWE-79",
+      "cwe_name": "Cross-site Scripting",
+      "language": "python",
+      "framework": "flask",
+      "expected_detection": true,
+      "vulnerability_summary": "Unescaped request parameter reflected directly into HTML response"
+    },
+    {
+      "id": "vc-06",
+      "file": "vulnerable_code/sample3.php",
+      "cwe": "CWE-79",
+      "cwe_name": "Cross-site Scripting",
+      "language": "php",
+      "framework": "none",
+      "expected_detection": true,
+      "vulnerability_summary": "echo of raw $_GET parameter into HTML without htmlspecialchars"
+    },
+    {
+      "id": "vc-07",
+      "file": "vulnerable_code/cwe79_xss_express.js",
+      "cwe": "CWE-79",
+      "cwe_name": "Cross-site Scripting",
+      "language": "javascript",
+      "framework": "express",
+      "expected_detection": true,
+      "vulnerability_summary": "Template literal with unescaped req.query.name sent as HTML response"
+    },
+    {
+      "id": "vc-08",
+      "file": "vulnerable_code/cwe79_xss_spring.java",
+      "cwe": "CWE-79",
+      "cwe_name": "Cross-site Scripting",
+      "language": "java",
+      "framework": "spring",
+      "expected_detection": true,
+      "vulnerability_summary": "String concatenation of request parameter into HTML response body"
+    },
+    {
+      "id": "vc-09",
+      "file": "vulnerable_code/cwe22_path_traversal_flask.py",
+      "cwe": "CWE-22",
+      "cwe_name": "Path Traversal",
+      "language": "python",
+      "framework": "flask",
+      "expected_detection": true,
+      "vulnerability_summary": "User-controlled filename concatenated to base directory path without sanitization"
+    },
+    {
+      "id": "vc-10",
+      "file": "vulnerable_code/cwe22_path_traversal_express.js",
+      "cwe": "CWE-22",
+      "cwe_name": "Path Traversal",
+      "language": "javascript",
+      "framework": "express",
+      "expected_detection": true,
+      "vulnerability_summary": "path.join used without checking resolved path stays within BASE_DIR"
+    },
+    {
+      "id": "vc-11",
+      "file": "vulnerable_code/cwe22_path_traversal_spring.java",
+      "cwe": "CWE-22",
+      "cwe_name": "Path Traversal",
+      "language": "java",
+      "framework": "spring",
+      "expected_detection": true,
+      "vulnerability_summary": "Request parameter appended to base path without canonicalization or prefix check"
+    },
+    {
+      "id": "vc-12",
+      "file": "vulnerable_code/cwe22_path_traversal_php.php",
+      "cwe": "CWE-22",
+      "cwe_name": "Path Traversal",
+      "language": "php",
+      "framework": "none",
+      "expected_detection": true,
+      "vulnerability_summary": "Direct concatenation of $_GET['file'] to base directory without realpath check"
+    },
+    {
+      "id": "vc-13",
+      "file": "vulnerable_code/03_cmd_sql_vuln01.js",
+      "cwe": "CWE-78",
+      "cwe_name": "OS Command Injection",
+      "language": "javascript",
+      "framework": "express",
+      "expected_detection": true,
+      "vulnerability_summary": "req.query.cmd concatenated into exec() shell string"
+    },
+    {
+      "id": "vc-14",
+      "file": "vulnerable_code/cwe78_cmd_injection_flask.py",
+      "cwe": "CWE-78",
+      "cwe_name": "OS Command Injection",
+      "language": "python",
+      "framework": "flask",
+      "expected_detection": true,
+      "vulnerability_summary": "User-supplied IP address concatenated into os.popen() shell command"
+    },
+    {
+      "id": "vc-15",
+      "file": "vulnerable_code/cwe78_cmd_injection_php.php",
+      "cwe": "CWE-78",
+      "cwe_name": "OS Command Injection",
+      "language": "php",
+      "framework": "none",
+      "expected_detection": true,
+      "vulnerability_summary": "User-supplied host passed directly to shell_exec() without escapeshellarg"
+    },
+    {
+      "id": "vc-16",
+      "file": "vulnerable_code/cwe78_cmd_injection_spring.java",
+      "cwe": "CWE-78",
+      "cwe_name": "OS Command Injection",
+      "language": "java",
+      "framework": "spring",
+      "expected_detection": true,
+      "vulnerability_summary": "Request parameter concatenated into sh -c shell string via Runtime.exec()"
+    },
+    {
+      "id": "vc-17",
+      "file": "vulnerable_code/auth_module.js",
+      "cwe": "CWE-287",
+      "cwe_name": "Improper Authentication",
+      "language": "javascript",
+      "framework": "node",
+      "expected_detection": true,
+      "vulnerability_summary": "Hardcoded JWT secret, MD5 password hashing, timing-vulnerable string comparison"
+    },
+    {
+      "id": "vc-18",
+      "file": "vulnerable_code/cwe287_auth_bypass_flask.py",
+      "cwe": "CWE-287",
+      "cwe_name": "Improper Authentication",
+      "language": "python",
+      "framework": "flask",
+      "expected_detection": true,
+      "vulnerability_summary": "SQL injection in login query enables authentication bypass"
+    },
+    {
+      "id": "vc-19",
+      "file": "vulnerable_code/cwe287_auth_bypass_php.php",
+      "cwe": "CWE-287",
+      "cwe_name": "Improper Authentication",
+      "language": "php",
+      "framework": "none",
+      "expected_detection": true,
+      "vulnerability_summary": "MD5 password hashing with loose == comparison enables magic hash bypass"
+    },
+    {
+      "id": "vc-20",
+      "file": "vulnerable_code/cwe287_weak_session_node.js",
+      "cwe": "CWE-287",
+      "cwe_name": "Improper Authentication",
+      "language": "javascript",
+      "framework": "express",
+      "expected_detection": true,
+      "vulnerability_summary": "Hardcoded JWT secret, no expiry, algorithm not pinned (alg:none bypass possible)"
+    }
+  ],
+  "vulnerable_code_holdout": [
+    {
+      "id": "ho-01",
+      "file": "vulnerable_code_holdout/sql_89_ruby.rb",
+      "cwe": "CWE-89",
+      "cwe_name": "SQL Injection",
+      "language": "ruby",
+      "framework": "sinatra",
+      "expected_detection": true,
+      "vulnerability_summary": "String interpolation of request parameter into raw SQLite3 query"
+    },
+    {
+      "id": "ho-02",
+      "file": "vulnerable_code_holdout/sql_89_csharp.cs",
+      "cwe": "CWE-89",
+      "cwe_name": "SQL Injection",
+      "language": "csharp",
+      "framework": "aspnet",
+      "expected_detection": true,
+      "vulnerability_summary": "String concatenation of query parameter into SqlCommand without parameterization"
+    },
+    {
+      "id": "ho-03",
+      "file": "vulnerable_code_holdout/xss_79_ruby.rb",
+      "cwe": "CWE-79",
+      "cwe_name": "Cross-site Scripting",
+      "language": "ruby",
+      "framework": "sinatra",
+      "expected_detection": true,
+      "vulnerability_summary": "Raw interpolation of params[:name] into HTML response without escaping"
+    },
+    {
+      "id": "ho-04",
+      "file": "vulnerable_code_holdout/xss_79_python_jinja.py",
+      "cwe": "CWE-79",
+      "cwe_name": "Cross-site Scripting",
+      "language": "python",
+      "framework": "flask",
+      "expected_detection": true,
+      "vulnerability_summary": "render_template_string called with user input embedded in template source (also SSTI)"
+    },
+    {
+      "id": "ho-05",
+      "file": "vulnerable_code_holdout/path_22_ruby.rb",
+      "cwe": "CWE-22",
+      "cwe_name": "Path Traversal",
+      "language": "ruby",
+      "framework": "sinatra",
+      "expected_detection": true,
+      "vulnerability_summary": "String concatenation of params[:file] to base directory without expand_path check"
+    },
+    {
+      "id": "ho-06",
+      "file": "vulnerable_code_holdout/path_22_python.py",
+      "cwe": "CWE-22",
+      "cwe_name": "Path Traversal",
+      "language": "python",
+      "framework": "flask",
+      "expected_detection": true,
+      "vulnerability_summary": "os.path.join silently discards BASE_DIR when filename is an absolute path"
+    },
+    {
+      "id": "ho-07",
+      "file": "vulnerable_code_holdout/cmd_78_node.js",
+      "cwe": "CWE-78",
+      "cwe_name": "OS Command Injection",
+      "language": "javascript",
+      "framework": "express",
+      "expected_detection": true,
+      "vulnerability_summary": "User-supplied domain concatenated into execSync shell string"
+    },
+    {
+      "id": "ho-08",
+      "file": "vulnerable_code_holdout/cmd_78_python.py",
+      "cwe": "CWE-78",
+      "cwe_name": "OS Command Injection",
+      "language": "python",
+      "framework": "flask",
+      "expected_detection": true,
+      "vulnerability_summary": "User-supplied filename passed to subprocess.run with shell=True"
+    },
+    {
+      "id": "ho-09",
+      "file": "vulnerable_code_holdout/auth_287_java.java",
+      "cwe": "CWE-287",
+      "cwe_name": "Improper Authentication",
+      "language": "java",
+      "framework": "spring",
+      "expected_detection": true,
+      "vulnerability_summary": "Unsalted SHA-1 password hashing; timing-unsafe hash comparison in SQL"
+    },
+    {
+      "id": "ho-10",
+      "file": "vulnerable_code_holdout/auth_287_go.go",
+      "cwe": "CWE-287",
+      "cwe_name": "Improper Authentication",
+      "language": "go",
+      "framework": "stdlib",
+      "expected_detection": true,
+      "vulnerability_summary": "Unsalted MD5 password hashing; plain == string comparison (timing attack)"
+    }
+  ]
+}

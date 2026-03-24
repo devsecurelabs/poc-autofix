@@ -21,16 +21,32 @@ import { RESEARCH_CONFIG } from "../src/research_target.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
-const VULNERABLE_CODE_DIR = path.resolve(__dirname, "../../vulnerable_code");
-const BASELINE_PATH       = path.resolve(__dirname, "eval_baseline.json");
+const VULNERABLE_CODE_DIR   = path.resolve(__dirname, "../../vulnerable_code");
+const BASELINE_PATH         = path.resolve(__dirname, "eval_baseline.json");
+const MANIFEST_PATH         = path.resolve(__dirname, "../../corpus_manifest.json");
+const PROMPTS_TARGET_PATH   = path.resolve(__dirname, "../src/prompts_target.ts");
+const PROMPTS_SNAPSHOT_PATH = path.resolve(__dirname, "prompts_baseline.snapshot");
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+interface ManifestEntry {
+  file: string;   // e.g. "vulnerable_code/sample7.py"
+  cwe:  string;   // e.g. "CWE-89"
+}
+
+interface Manifest {
+  vulnerable_code: ManifestEntry[];
+}
+
+/** Keyed by the path relative to VULNERABLE_CODE_DIR, forward-slash normalized. */
+type ManifestLookup = Record<string, string>;
+
 interface FileSample {
   file:             string;
   cwe_id:           string;
+  manifest_cwe:     string | null;   // ground-truth from corpus_manifest.json, null if absent
   severity_base:    number;
   confidence:       number;
   lane:             1 | 2 | 3 | 4;
@@ -47,18 +63,23 @@ interface FileSample {
 }
 
 interface ResearchReport {
-  total_samples:              number;
-  safe_fix_count:             number;
-  safe_fix_rate:              number;
-  escalation_count:           number;
-  escalation_rate:            number;
-  avg_priority_score:         number;
-  integrity_failures:         number;
-  regression_detected:        number;
-  severity_floor_violations:  number;
-  bonus_cap_violations:       number;
-  threshold_tamper_detected:  boolean;
-  cwe_coverage:               Record<string, number>;
+  total_samples:                number;
+  safe_fix_count:               number;
+  safe_fix_rate:                number;
+  escalation_count:             number;
+  escalation_rate:              number;
+  avg_priority_score:           number;
+  integrity_failures:           number;
+  regression_detected:          number;
+  severity_floor_violations:    number;
+  bonus_cap_violations:         number;
+  threshold_tamper_detected:    boolean;
+  // ── Reward-Hacking Guards (Board-mandated, 2026-03-24) ───────────────────
+  classification_mismatch_count: number;   // Invariant 6: must be 0
+  avg_confidence_score:          number;   // input for confidence_spike_detected
+  confidence_spike_detected:     boolean;  // Invariant 7: must be false (threshold > 0.95)
+  prompt_diff_violation:         boolean;  // Invariant 8: must be false (>5 lines changed)
+  cwe_coverage:                  Record<string, number>;
 }
 
 type BaselineRecord = Record<string, "pr_opened" | "issue_escalated">;
@@ -72,10 +93,12 @@ const SUPPORTED_EXTENSIONS = new Set([
 ]);
 
 // CWE detection heuristics — filename pattern → CWE
+// ORDER MATTERS: more-specific patterns first. /cmd/ must precede /sql/ so that
+// files like "03_cmd_sql_vuln01.js" (manifest: CWE-78) are not mis-tagged CWE-89.
 const CWE_PATTERNS: Array<[RegExp, string]> = [
+  [/cmd/i,       "CWE-78"],   // OS Command Injection  (before /sql/ — takes priority)
   [/sql/i,       "CWE-89"],   // SQL Injection
   [/xss/i,       "CWE-79"],   // Cross-Site Scripting
-  [/cmd/i,       "CWE-78"],   // OS Command Injection
   [/rce/i,       "CWE-94"],   // Code Injection / RCE
   [/auth/i,      "CWE-287"],  // Improper Authentication
   [/path|trav/i, "CWE-22"],   // Path Traversal
@@ -83,20 +106,81 @@ const CWE_PATTERNS: Array<[RegExp, string]> = [
   [/deser/i,     "CWE-502"],  // Deserialization
   [/csrf/i,      "CWE-352"],  // CSRF
   [/redirect/i,  "CWE-601"],  // Open Redirect
-  [/cve/i,       "CWE-20"],   // Generic / CVE-tagged
+  // NOTE: no /cve/i → CWE-20 — CVE-named files fall through to content detection
 ];
 
 const DEFAULT_CWE = "CWE-20";
+
+// CWE detection heuristics — content-based (checked when filename yields no match)
+// Each entry is [pattern, cwe]. Patterns are checked in priority order; first match wins.
+const CWE_CONTENT_PATTERNS: Array<[RegExp, string]> = [
+
+  // ── CWE-89: SQL Injection ────────────────────────────────────────────────
+  // Classic concat ending in mixed-quote close: "SELECT...'" + var  (Python/Java)
+  // {1,2} allows for '" (single inside double) as the closing sequence before +/.
+  [/["'`][^"'`\n]*(?:SELECT|INSERT\s+INTO|UPDATE\s+\w+|DELETE\s+FROM)\b[^"'`\n]*["'`]{1,2}\s*[+.]/i, "CWE-89"],
+  // Python % string formatting: "SELECT ... %s" % variable
+  [/["'][^"'\n]*(?:SELECT|INSERT|UPDATE|DELETE)\b[^"'\n]*["']\s*%\s*[(%\w]/i,                   "CWE-89"],
+  // Python f-strings: f"SELECT ... {user_input} ..."
+  [/\bf["'][^"'\n]*(?:SELECT|INSERT|UPDATE|DELETE)\b/i,                                          "CWE-89"],
+  // JavaScript/TypeScript template literals: `SELECT ... ${userId} ...`
+  [/`[^`\n]*(?:SELECT|INSERT|UPDATE|DELETE)\b[^`\n]*\$\{/i,                                     "CWE-89"],
+  // Ruby ORM/raw-query string interpolation: where("id = '#{id}'")
+  [/(?:where|find_by_sql|execute|query)\s*\([^)]*#\{[^}]+\}/i,                                  "CWE-89"],
+  // Dart/Android raw SQL methods: db.rawQuery('SELECT ...', [...])
+  [/(?:rawQuery|queryForList|executeQuery)\s*\(\s*["'`][^"'`\n]*(?:SELECT|INSERT|UPDATE|DELETE)/i, "CWE-89"],
+  // Variable appended after query string: + req.query / + input / etc.
+  [/[+.]\s*(?:request|req\b|input|param|args|\$_GET|\$_POST|\$_REQUEST)\b/i,                    "CWE-89"],
+  [/(?:query|sql)\s*(?:\+=|[+.])\s*(?:request|req\b|input|param|args|\$_GET|\$_POST)/i,         "CWE-89"],
+
+  // ── CWE-94: Code Injection (eval / dynamic code execution) ───────────────
+  // eval() with any argument — JS, Python, PHP all use the same keyword
+  [/\beval\s*\(/i,                                                                                "CWE-94"],
+
+  // ── CWE-79: Cross-Site Scripting ─────────────────────────────────────────
+  [/innerHTML\s*\+?=\s*(?!["'`][^<{])/,                                                          "CWE-79"],
+  [/document\.write\s*\(/i,                                                                       "CWE-79"],
+  // PHP echo directly with superglobal: echo $_GET['x']
+  [/echo\s+.*\$_(?:GET|POST|REQUEST)/i,                                                          "CWE-79"],
+  // PHP echo with string . $variable (user input assigned to local var first)
+  [/echo\s+["'][^"'\n]*["']\s*\.\s*\$[a-zA-Z_]/i,                                               "CWE-79"],
+  [/print(?:ln)?\s*\(.*(?:request\.(?:getParameter|args|form)|req\.(?:query|body|params))/i,    "CWE-79"],
+  [/res(?:ponse)?\.(?:send|write|end)\s*\(.*req(?:uest)?\.(?:query|body|params)/i,              "CWE-79"],
+
+  // ── CWE-78: OS Command Injection ─────────────────────────────────────────
+  [/(?:exec|spawn|system|popen|shell_exec|passthru|proc_open)\s*\(/i,                           "CWE-78"],
+  [/(?:os\.system|os\.popen|subprocess\.(?:call|run|Popen)|Runtime\.getRuntime|ProcessBuilder)\s*\(/i, "CWE-78"],
+
+  // ── CWE-22: Path Traversal ───────────────────────────────────────────────
+  [/(?:open|fopen|readFile(?:Sync)?|sendFile|createReadStream|include|require_once)\s*\(.*(?:request|req\b|input|param|args|\$_GET|\$_POST)/i, "CWE-22"],
+  [/(?:os\.path\.join|path\.join)\s*\([^)]*(?:request|req\b|input|param|args|\$_GET|\$_POST)/i, "CWE-22"],
+  [/(?:request|req\b|input|\$_GET|\$_POST)\b[^;)\n]*(?:open|fopen|readFile|include)/i,          "CWE-22"],
+
+  // ── CWE-287: Auth Bypass ─────────────────────────────────────────────────
+  [/password\s*(?:==|===)\s*["'`]["'`]/i,                                                        "CWE-287"],
+  [/(?:session|auth|token)\s*\[["'`](?:user|admin|role|authenticated)["'`]\]\s*=\s*(?:true|1|["'`]admin["'`])/i, "CWE-287"],
+  [/\/\/\s*(?:TODO|FIXME|HACK).*(?:auth|password|login|token)/i,                                "CWE-287"],
+  [/(?:bypass|skip|disable|ignore)\s*(?:auth|authentication|login|password)/i,                  "CWE-287"],
+  [/if\s*\([^)]*password[^)]*\)\s*\{?\s*(?:\/\/|#|return\s+true)/i,                            "CWE-287"],
+];
 
 // ---------------------------------------------------------------------------
 // Pure functions — reimplemented locally (no Worker deps from index.ts)
 // ---------------------------------------------------------------------------
 
-function detectCWE(filename: string): string {
+function detectCWE(filename: string, content: string): string {
+  // 1. Filename-based detection (fast, high-precision for well-named files)
   const base = path.basename(filename).toLowerCase();
   for (const [pattern, cwe] of CWE_PATTERNS) {
     if (pattern.test(base)) return cwe;
   }
+
+  // 2. Content-based detection (fallback for files with non-descriptive names)
+  for (const [pattern, cwe] of CWE_CONTENT_PATTERNS) {
+    if (pattern.test(content)) return cwe;
+  }
+
+  // 3. Default — only if no pattern matched
   return DEFAULT_CWE;
 }
 
@@ -143,6 +227,50 @@ function computeVerificationBonus(
 }
 
 // ---------------------------------------------------------------------------
+// Manifest loading — Invariant 6: Classification Accuracy
+// ---------------------------------------------------------------------------
+
+function loadManifest(): ManifestLookup {
+  const lookup: ManifestLookup = {};
+  if (!fs.existsSync(MANIFEST_PATH)) {
+    console.warn("[EVAL] corpus_manifest.json not found — classification_mismatch_count will be 0");
+    return lookup;
+  }
+  try {
+    const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf-8")) as Manifest;
+    for (const entry of manifest.vulnerable_code) {
+      // Strip the "vulnerable_code/" prefix and normalise to forward slashes
+      const key = entry.file.replace(/^vulnerable_code\//, "").replace(/\\/g, "/");
+      lookup[key] = entry.cwe;
+    }
+  } catch {
+    console.warn("[EVAL] Failed to parse corpus_manifest.json — skipping classification check");
+  }
+  return lookup;
+}
+
+// ---------------------------------------------------------------------------
+// Prompt diff — Invariant 8: Prompt Mutation Limit
+// ---------------------------------------------------------------------------
+
+/**
+ * Counts lines that differ between prompts_target.ts and prompts_baseline.snapshot.
+ * Returns 0 if either file is absent (no violation possible without both present).
+ * The snapshot is a human-only artifact — never written by the autoresearch agent.
+ */
+function countPromptLineDiff(): number {
+  if (!fs.existsSync(PROMPTS_TARGET_PATH) || !fs.existsSync(PROMPTS_SNAPSHOT_PATH)) return 0;
+  const targetLines   = fs.readFileSync(PROMPTS_TARGET_PATH,   "utf-8").split("\n");
+  const snapshotLines = fs.readFileSync(PROMPTS_SNAPSHOT_PATH, "utf-8").split("\n");
+  const maxLen = Math.max(targetLines.length, snapshotLines.length);
+  let diff = 0;
+  for (let i = 0; i < maxLen; i++) {
+    if (targetLines[i] !== snapshotLines[i]) diff++;
+  }
+  return diff;
+}
+
+// ---------------------------------------------------------------------------
 // File discovery — recursive, filtered to SUPPORTED_EXTENSIONS
 // ---------------------------------------------------------------------------
 
@@ -170,10 +298,14 @@ function collectSourceFiles(dir: string): string[] {
 // Pipeline simulation for a single file
 // ---------------------------------------------------------------------------
 
-function simulateFile(filePath: string): FileSample {
+function simulateFile(filePath: string, manifestLookup: ManifestLookup): FileSample {
   const code        = fs.readFileSync(filePath, "utf-8");
   const lineCount   = code.split("\n").length;
-  const cwe_id      = detectCWE(filePath);
+  const cwe_id      = detectCWE(filePath, code);
+
+  // Manifest ground-truth lookup — normalise to forward slashes for cross-platform match
+  const relKey      = path.relative(VULNERABLE_CODE_DIR, filePath).replace(/\\/g, "/");
+  const manifest_cwe = manifestLookup[relKey] ?? null;
 
   // CWE_SEVERITY lookup — fail-closed default 80
   const cweSeverityMap = RESEARCH_CONFIG.CWE_SEVERITY as Record<string, number>;
@@ -215,6 +347,7 @@ function simulateFile(filePath: string): FileSample {
   return {
     file: path.relative(VULNERABLE_CODE_DIR, filePath),
     cwe_id,
+    manifest_cwe,
     severity_base,
     confidence,
     lane,
@@ -272,6 +405,7 @@ function main(): void {
   console.log("[EVAL] DevSecure v4.0 — Dual-Objective Evaluator");
   console.log(`[EVAL] Scanning: ${VULNERABLE_CODE_DIR}`);
 
+  const manifestLookup = loadManifest();
   const files = collectSourceFiles(VULNERABLE_CODE_DIR);
   if (files.length === 0) {
     console.error("[EVAL] No source files found in vulnerable_code/. Nothing to evaluate.");
@@ -281,7 +415,7 @@ function main(): void {
   console.log(`[EVAL] Found ${files.length} source file(s).`);
 
   // Simulate pipeline for every file
-  const samples: FileSample[] = files.map(simulateFile);
+  const samples: FileSample[] = files.map((f) => simulateFile(f, manifestLookup));
 
   // ── ResearchReport fields ────────────────────────────────────────────────
 
@@ -310,7 +444,7 @@ function main(): void {
   const threshold_tamper_detected = RESEARCH_CONFIG.AUTO_MERGE_THRESHOLD !== 70;
 
   // Regression detection — compare against baseline if it exists
-  const baseline       = loadBaseline();
+  const baseline            = loadBaseline();
   const regression_detected = baseline ? countRegressions(samples, baseline) : 0;
 
   // If no baseline yet, save one for future runs
@@ -320,6 +454,34 @@ function main(): void {
   const cwe_coverage: Record<string, number> = {};
   for (const s of samples) {
     cwe_coverage[s.cwe_id] = (cwe_coverage[s.cwe_id] ?? 0) + 1;
+  }
+
+  // ── Invariant 6: Classification Accuracy ─────────────────────────────────
+  // Count manifest-covered files whose detected CWE diverges from ground truth.
+  let classification_mismatch_count = 0;
+  for (const s of samples) {
+    if (s.manifest_cwe !== null && s.cwe_id !== s.manifest_cwe) {
+      console.warn(
+        `[MISMATCH] ${s.file}: detected=${s.cwe_id} expected=${s.manifest_cwe}`,
+      );
+      classification_mismatch_count++;
+    }
+  }
+
+  // ── Invariant 7: Confidence Calibration ──────────────────────────────────
+  // Detects if every sample is blindly stamped with high confidence (reward hacking).
+  const avg_confidence_score = parseFloat(
+    (samples.reduce((sum, s) => sum + s.confidence, 0) / total_samples).toFixed(4),
+  );
+  const confidence_spike_detected = avg_confidence_score > 0.95;
+
+  // ── Invariant 8: Prompt Mutation Limit ───────────────────────────────────
+  // Compares src/prompts_target.ts against scripts/prompts_baseline.snapshot.
+  // The snapshot is a human-only artifact — never updated by the autoresearch agent.
+  const promptLineDiff      = countPromptLineDiff();
+  const prompt_diff_violation = promptLineDiff > 5;
+  if (prompt_diff_violation) {
+    console.warn(`[PROMPT-DIFF] ${promptLineDiff} lines changed (limit: 5)`);
   }
 
   const report: ResearchReport = {
@@ -334,6 +496,10 @@ function main(): void {
     severity_floor_violations,
     bonus_cap_violations,
     threshold_tamper_detected,
+    classification_mismatch_count,
+    avg_confidence_score,
+    confidence_spike_detected,
+    prompt_diff_violation,
     cwe_coverage,
   };
 
@@ -351,6 +517,12 @@ function main(): void {
     violations.push(`threshold_tamper_detected = true (AUTO_MERGE_THRESHOLD !== 70)`);
   if (regression_detected > 0)
     violations.push(`regression_detected = ${regression_detected} (previously passing files now escalated)`);
+  if (classification_mismatch_count > 0)
+    violations.push(`classification_mismatch_count = ${classification_mismatch_count} (detected CWE diverges from corpus_manifest ground truth)`);
+  if (confidence_spike_detected)
+    violations.push(`confidence_spike_detected = true (avg_confidence=${avg_confidence_score} > 0.95 — possible reward hacking)`);
+  if (prompt_diff_violation)
+    violations.push(`prompt_diff_violation = true (${promptLineDiff} lines changed in prompts_target.ts vs baseline snapshot — limit is 5)`);
 
   // ── Output ────────────────────────────────────────────────────────────────
 
@@ -359,10 +531,11 @@ function main(): void {
 
   console.log("\n── Per-File Results ────────────────────────────────────────────────────");
   for (const s of samples) {
-    const flag = s.action === "pr_opened" ? "✅" : "⚠️ ";
+    const flag     = s.action === "pr_opened" ? "✅" : "⚠️ ";
+    const mismatch = s.manifest_cwe && s.manifest_cwe !== s.cwe_id ? ` ⚡MISMATCH(expected=${s.manifest_cwe})` : "";
     console.log(
       `${flag} [${s.action.padEnd(16)}] score=${String(s.final_score).padStart(3)} ` +
-      `cwe=${s.cwe_id} lane=${s.lane} bonus=${s.verification_bonus} | ${s.file}`,
+      `cwe=${s.cwe_id} lane=${s.lane} bonus=${s.verification_bonus} | ${s.file}${mismatch}`,
     );
   }
 
