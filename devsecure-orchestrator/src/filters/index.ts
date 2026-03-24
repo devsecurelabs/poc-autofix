@@ -13,3 +13,4 @@ export {
 } from "./dedup";
 export { isHighRiskFile, checkNoDetectionEscalation }          from "./escalation";
 export { runPreFilterPipeline, buildL2BatchPayload }           from "./pipeline";
+export { dispatchToL2 }                                        from "./dispatcher";

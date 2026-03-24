@@ -312,3 +312,16 @@ export const preFilterStatsSchema = z.object({
   (data) => data.removed_count === data.input_count - data.output_count,
   { message: "removed_count must equal input_count minus output_count" },
 );
+
+// ---------------------------------------------------------------------------
+// L2DispatchResult — result of sending the batch payload to the L2 Worker
+// ---------------------------------------------------------------------------
+
+/** Result returned by dispatchToL2 after attempting to send the payload. */
+export interface L2DispatchResult {
+  success:       boolean;
+  status:        number;
+  request_id:    string | null;
+  latency_ms:    number;
+  error_message: string | null;
+}
