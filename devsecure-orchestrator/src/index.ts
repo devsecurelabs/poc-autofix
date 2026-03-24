@@ -8,7 +8,16 @@ import { seedCWEData } from "./seed-data";
 import type { Env } from "./env";
 import { emitEvent } from "./telemetry";
 import { RESEARCH_CONFIG } from "./research_target";
-import { CLASSIFY_SYSTEM_PROMPT, buildRemediatePrompt } from "./prompts_target";
+import { CLASSIFY_SYSTEM_PROMPT, buildRemediatePrompt, JUDGE_SYSTEM_PROMPT } from "./prompts_target";
+import sanitizeHtml from "sanitize-html";
+import type {
+  JudgeEvaluationInput,
+  JudgeEvaluation,
+  RoutingResult,
+  RoutingTag,
+  TicketPayload,
+} from "./types";
+import { judgeEvaluationSchema } from "./types";
 
 // HF Inference Router — primary 2026 endpoint; model dispatched via body "model" field
 const HF_CHAT_URL = "https://router.huggingface.co/v1/chat/completions";
@@ -2520,3 +2529,246 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env>;
+
+// ---------------------------------------------------------------------------
+// Requirement 9 — Adversarial Judge Evaluation Function
+// ---------------------------------------------------------------------------
+
+const SANITIZE_OPTS: sanitizeHtml.IOptions = { allowedTags: [], allowedAttributes: {} };
+
+/**
+ * evaluateWithJudge — calls the adversarial judge LLM and returns a validated,
+ * sanitised JudgeEvaluation. Fail-closed: any parse or schema failure returns
+ * UNCERTAIN with the appropriate error flag rather than propagating an exception.
+ */
+export async function evaluateWithJudge(
+  input: JudgeEvaluationInput,
+  env: Env,
+): Promise<JudgeEvaluation> {
+  const model = env.JUDGE_MODEL ?? DEFAULT_JUDGE_MODEL;
+
+  const userMessage = JSON.stringify({
+    patch_diff:        input.patch_diff,
+    original_finding:  input.original_finding,
+    detection_signal:  input.detection_signal,
+    file_path:         input.file_path,
+  }, null, 2);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), JUDGE_TIMEOUT_MS);
+
+  let rawResponse = "";
+  try {
+    const res = await fetch(OPENAI_CHAT_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.JUDGE_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: JUDGE_SYSTEM_PROMPT },
+          { role: "user",   content: userMessage },
+        ],
+        max_tokens: 1024,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Judge API error: HTTP ${res.status} — ${errText}`);
+    }
+
+    const data = (await res.json()) as { choices: Array<{ message: { content: string } }> };
+    rawResponse = data.choices[0].message.content.trim();
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  // ── FIRST: JSON.parse ─────────────────────────────────────────────────────
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawResponse);
+  } catch {
+    const result: JudgeEvaluation = {
+      verdict:    "UNCERTAIN",
+      confidence: 0.0,
+      risk_flags: ["json_parse_error"],
+      evidence:   "Judge returned non-JSON response",
+      comments:   sanitizeHtml(rawResponse.slice(0, 200), SANITIZE_OPTS),
+    };
+    console.log(JSON.stringify({
+      audit:               "judge_evaluation",
+      timestamp:           new Date().toISOString(),
+      input: {
+        file_path:         input.file_path,
+        cwe_id:            input.original_finding.cwe_id,
+        detection_signal:  input.detection_signal,
+        source_scanner:    input.original_finding.source_scanner,
+      },
+      raw_response_length: rawResponse.length,
+      parsed_verdict:      result.verdict,
+      parsed_confidence:   result.confidence,
+      risk_flags:          result.risk_flags,
+      routing_decision:    null,
+    }));
+    return result;
+  }
+
+  // ── SECOND: Zod schema validation ────────────────────────────────────────
+  const validation = judgeEvaluationSchema.safeParse(parsed);
+  if (!validation.success) {
+    const zodMsg = validation.error.message.slice(0, 500);
+    const result: JudgeEvaluation = {
+      verdict:    "UNCERTAIN",
+      confidence: 0.0,
+      risk_flags: ["schema_validation_error"],
+      evidence:   zodMsg,
+      comments:   "Judge response was valid JSON but failed schema validation",
+    };
+    console.log(JSON.stringify({
+      audit:               "judge_evaluation",
+      timestamp:           new Date().toISOString(),
+      input: {
+        file_path:         input.file_path,
+        cwe_id:            input.original_finding.cwe_id,
+        detection_signal:  input.detection_signal,
+        source_scanner:    input.original_finding.source_scanner,
+      },
+      raw_response_length: rawResponse.length,
+      parsed_verdict:      result.verdict,
+      parsed_confidence:   result.confidence,
+      risk_flags:          result.risk_flags,
+      routing_decision:    null,
+    }));
+    return result;
+  }
+
+  // ── THIRD: Sanitise and truncate ─────────────────────────────────────────
+  const data = validation.data;
+  const result: JudgeEvaluation = {
+    verdict:    data.verdict,
+    confidence: data.confidence,
+    risk_flags: data.risk_flags,
+    evidence:   sanitizeHtml(data.evidence, SANITIZE_OPTS).slice(0, 500),
+    comments:   sanitizeHtml(data.comments, SANITIZE_OPTS).slice(0, 2000),
+  };
+
+  console.log(JSON.stringify({
+    audit:               "judge_evaluation",
+    timestamp:           new Date().toISOString(),
+    input: {
+      file_path:         input.file_path,
+      cwe_id:            input.original_finding.cwe_id,
+      detection_signal:  input.detection_signal,
+      source_scanner:    input.original_finding.source_scanner,
+    },
+    raw_response_length: rawResponse.length,
+    parsed_verdict:      result.verdict,
+    parsed_confidence:   result.confidence,
+    risk_flags:          result.risk_flags,
+    routing_decision:    null,
+  }));
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Requirement 9 — Routing Logic
+// ---------------------------------------------------------------------------
+
+function buildTicketMarkdown(
+  evaluation: JudgeEvaluation,
+  input:      JudgeEvaluationInput,
+  action:     RoutingTag,
+): string {
+  const flags = evaluation.risk_flags.map(f => `- ⚠️ ${f}`).join("\n");
+  return [
+    "## Security Review Required",
+    "",
+    `**Verdict:** ${evaluation.verdict} (Confidence: ${evaluation.confidence})`,
+    `**Routing:** ${action}`,
+    `**Detection Signal:** ${input.detection_signal}`,
+    `**CWE:** ${input.original_finding.cwe_id} — ${input.original_finding.cwe_name}`,
+    `**File:** ${input.file_path}`,
+    "",
+    "### Risk Flags",
+    flags,
+    "",
+    "### Evidence",
+    evaluation.evidence,
+    "",
+    "### Recommended Actions",
+    evaluation.comments,
+    "",
+    "---",
+    "*Generated by DevSecure L3 Adversarial Judge. This finding requires human review before merge.*",
+  ].join("\n");
+}
+
+const SEVERITY_MAP: Record<RoutingTag, TicketPayload["severity"]> = {
+  JUDGE_REJECTED:          "critical",
+  SENIOR_REVIEW_REQUIRED:  "high",
+  LOW_CONFIDENCE_PASS:     "high",
+  SOFT_PASS_REVIEW:        "medium",
+  STANDARD_REVIEW:         "medium",
+  AUTO_MERGE:              "low",  // never used — AUTO_MERGE returns null ticket
+};
+
+/**
+ * routeJudgeResult — pure decision function. Maps a JudgeEvaluation to a
+ * RoutingResult using the canonical decision tree from Requirement 9.
+ */
+export function routeJudgeResult(
+  evaluation: JudgeEvaluation,
+  input:      JudgeEvaluationInput,
+): RoutingResult {
+  let action: RoutingTag;
+
+  if (evaluation.verdict === "PASS" && evaluation.confidence > 0.85) {
+    action = "AUTO_MERGE";
+  } else if (evaluation.verdict === "PASS" && evaluation.confidence >= 0.70) {
+    action = "SOFT_PASS_REVIEW";
+  } else if (evaluation.verdict === "PASS" && evaluation.confidence < 0.70) {
+    action = "LOW_CONFIDENCE_PASS";
+  } else if (evaluation.verdict === "FAIL") {
+    action = "JUDGE_REJECTED";
+  } else if (evaluation.verdict === "UNCERTAIN" && evaluation.confidence < 0.50) {
+    action = "SENIOR_REVIEW_REQUIRED";
+  } else {
+    // UNCERTAIN && confidence >= 0.50
+    action = "STANDARD_REVIEW";
+  }
+
+  const ticket_payload: TicketPayload | null =
+    action === "AUTO_MERGE"
+      ? null
+      : {
+          title:            `[${action}] ${input.original_finding.cwe_id} in ${input.file_path}`,
+          severity:         SEVERITY_MAP[action],
+          risk_flags:       evaluation.risk_flags,
+          evidence:         evaluation.evidence,
+          comments:         evaluation.comments,
+          detection_signal: input.detection_signal,
+          source_file:      input.file_path,
+          cwe_id:           input.original_finding.cwe_id,
+          routing_tag:      action,
+          markdown_body:    buildTicketMarkdown(evaluation, input, action),
+        };
+
+  console.log(JSON.stringify({
+    audit:       "judge_routing",
+    timestamp:   new Date().toISOString(),
+    file_path:   input.file_path,
+    cwe_id:      input.original_finding.cwe_id,
+    verdict:     evaluation.verdict,
+    confidence:  evaluation.confidence,
+    routing_tag: action,
+    has_ticket:  ticket_payload !== null,
+  }));
+
+  return { action, evaluation, ticket_payload };
+}

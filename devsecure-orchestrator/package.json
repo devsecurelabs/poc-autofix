@@ -6,12 +6,20 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "build": "tsc",
-    "eval": "tsx scripts/eval_harness.ts"
+    "eval": "tsx scripts/eval_harness.ts",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250310.0",
+    "@types/sanitize-html": "^2.16.1",
+    "@vitest/runner": "^4.1.1",
     "tsx": "^4.21.0",
     "typescript": "^5.5.2",
+    "vitest": "^4.1.1",
     "wrangler": "^3.109.0"
+  },
+  "dependencies": {
+    "sanitize-html": "^2.17.2",
+    "zod": "^4.3.6"
   }
 }
