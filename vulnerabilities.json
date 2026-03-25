@@ -1,0 +1,13 @@
+[
+  {
+    "timestamp": "2026-03-25T00:32:00.353Z",
+    "repo": "devsecurelabs/poc-autofix",
+    "file_path": "vulnerable_code/pilot_eval_usage.js",
+    "cwe_id": "CWE-94",
+    "severity": "high",
+    "confidence": 1,
+    "priority_score": 70,
+    "action": "pr_opened",
+    "github_url": ""
+  }
+]
