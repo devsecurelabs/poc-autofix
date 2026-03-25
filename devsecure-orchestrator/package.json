@@ -11,9 +11,11 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250310.0",
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^25.5.0",
     "@types/sanitize-html": "^2.16.1",
     "@vitest/runner": "^4.1.1",
+    "js-yaml": "^4.1.1",
     "tsx": "^4.21.0",
     "typescript": "^5.5.2",
     "vitest": "^4.1.1",

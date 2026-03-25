@@ -1,0 +1,178 @@
+# Author: Jeremy Quadri
+# .github/workflows/devsecure-sast.yml — DevSecure L1 Detection Plane: parallel SAST scan + orchestration.
+
+name: DevSecure SAST Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: OpenGrep (Semgrep-compatible) SAST scan — SAST-only ruleset
+  # ---------------------------------------------------------------------------
+  scan-opengrep:
+    runs-on: ubuntu-latest
+    outputs:
+      semgrep-version: ${{ steps.semgrep-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Get changed files
+        id: changed-files
+        run: |
+          FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} | tr '\n' ' ')
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+          echo "file_list<<EOF" >> $GITHUB_OUTPUT
+          git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Get Semgrep version
+        id: semgrep-version
+        run: echo "version=$(semgrep --version)" >> $GITHUB_OUTPUT
+
+      # p/r2c-security-audit = SAST-only rules. Do NOT use --config=auto or p/default
+      # (those include secrets/best-practices which violate Requirement 1 Scope Lock).
+      - name: Run OpenGrep SAST Scan
+        continue-on-error: true
+        run: |
+          semgrep scan \
+            --config=p/r2c-security-audit \
+            --sarif \
+            --output=opengrep.sarif \
+            ${{ steps.changed-files.outputs.files }}
+
+      - name: Ensure SARIF exists
+        run: |
+          if [ ! -f opengrep.sarif ]; then
+            echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"semgrep","rules":[]}},"results":[]}]}' > opengrep.sarif
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opengrep-sarif
+          path: opengrep.sarif
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Bearer SAST scan — diff mode, SARIF output
+  # ---------------------------------------------------------------------------
+  scan-bearer:
+    runs-on: ubuntu-latest
+    outputs:
+      bearer-version: ${{ steps.bearer-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Get changed files
+        id: changed-files
+        run: |
+          FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} | tr '\n' ' ')
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+          echo "file_list<<EOF" >> $GITHUB_OUTPUT
+          git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Run Bearer SAST Scan
+        id: bearer-scan
+        uses: bearer/bearer-action@v2
+        continue-on-error: true
+        with:
+          scanner: sast
+          diff: true
+          format: sarif
+          output: bearer.sarif
+
+      - name: Get Bearer version
+        id: bearer-version
+        run: echo "version=$(bearer version 2>/dev/null || echo 'unknown')" >> $GITHUB_OUTPUT
+
+      - name: Ensure SARIF exists
+        run: |
+          if [ ! -f bearer.sarif ]; then
+            echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"bearer","rules":[]}},"results":[]}]}' > bearer.sarif
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bearer-sarif
+          path: bearer.sarif
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Orchestrate — consumes both SARIF artifacts, runs L1.5 pre-filter,
+  #         dispatches filtered batch to L2 Cloudflare Worker.
+  # if: always() ensures this runs even when a scanner job fails (partial SARIF
+  # may still contain findings worth processing).
+  # ---------------------------------------------------------------------------
+  orchestrate:
+    runs-on: ubuntu-latest
+    needs: [scan-opengrep, scan-bearer]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: opengrep-sarif
+          path: ./sarif-results/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bearer-sarif
+          path: ./sarif-results/
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: devsecure-orchestrator/package-lock.json
+
+      - name: Install dependencies
+        working-directory: devsecure-orchestrator
+        run: npm ci
+
+      - name: Load suppressions
+        id: suppressions
+        run: |
+          if [ -f .devsecure-ignore.yml ]; then
+            echo "file=.devsecure-ignore.yml" >> $GITHUB_OUTPUT
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get changed files
+        id: changed-files
+        run: |
+          git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} > changed_files.txt
+
+      - name: Run DevSecure Orchestrator
+        working-directory: devsecure-orchestrator
+        env:
+          DEVSECURE_WORKER_URL: ${{ secrets.DEVSECURE_WORKER_URL }}
+          DEVSECURE_API_TOKEN: ${{ secrets.DEVSECURE_API_TOKEN }}
+          PR_REF: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          OPENGREP_SARIF: ${{ github.workspace }}/sarif-results/opengrep.sarif
+          BEARER_SARIF: ${{ github.workspace }}/sarif-results/bearer.sarif
+          CHANGED_FILES: ${{ github.workspace }}/changed_files.txt
+          SUPPRESSIONS_FILE: ${{ steps.suppressions.outputs.exists == 'true' && '.devsecure-ignore.yml' || '' }}
+          OPENGREP_VERSION: ${{ needs.scan-opengrep.outputs.semgrep-version || 'unknown' }}
+          BEARER_VERSION: ${{ needs.scan-bearer.outputs.bearer-version || 'unknown' }}
+        run: |
+          npx tsx scripts/run-orchestrator.ts
