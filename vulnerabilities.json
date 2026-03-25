@@ -1,0 +1,13 @@
+[
+  {
+    "timestamp": "2026-03-25T00:32:11.582Z",
+    "repo": "devsecurelabs/poc-autofix",
+    "file_path": "vulnerable_code/pilot_sqli_direct.js",
+    "cwe_id": "CWE-89",
+    "severity": "high",
+    "confidence": 1,
+    "priority_score": 75,
+    "action": "pr_opened",
+    "github_url": ""
+  }
+]
