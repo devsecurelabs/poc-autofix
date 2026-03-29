@@ -80,20 +80,9 @@ response.json
 # -----------------------------
 # DevSecure specific
 # -----------------------------
-remediated_code/   # generated output (optional: keep if you want history)
+#  remediated_code/   # generated output (optional: keep if you want history)
 
 .dev.vars*
 !.dev.vars.example
-. c l a u d e / 
- 
- . c l a u d e / 
- 
- . c l a u d e / 
- 
- . c l a u d e / 
- 
- . c l a u d e / 
- 
- . c l a u d e / 
- 
+.claude/
  
