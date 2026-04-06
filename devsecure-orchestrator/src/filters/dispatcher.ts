@@ -43,6 +43,8 @@ export async function dispatchToL2(
   const maxRetries = config.maxRetries ?? 2;
   const requestId  = crypto.randomUUID();
 
+  const remediateUrl = new URL("/remediate", config.workerUrl).toString();
+
   const findingsCount    = payload.files.reduce((sum, f) => sum + f.findings.length, 0);
   const escalationsCount = payload.files.filter((f) => f.is_escalation).length;
 
@@ -60,7 +62,7 @@ export async function dispatchToL2(
     const startTime    = Date.now();
 
     try {
-      const response = await fetch(config.workerUrl, {
+      const response = await fetch(remediateUrl, {
         method: "POST",
         headers: {
           Authorization:   `Bearer ${config.apiToken}`,
