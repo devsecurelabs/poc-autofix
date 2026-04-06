@@ -43,7 +43,8 @@ export async function dispatchToL2(
   const maxRetries = config.maxRetries ?? 2;
   const requestId  = crypto.randomUUID();
 
-  const remediateUrl = new URL("/remediate", config.workerUrl).toString();
+  const baseUrl   = process.env.DEVSECURE_WORKER_URL?.replace(/\/$/, '') || '';
+  const targetUrl = `${baseUrl}/remediate`;
 
   const findingsCount    = payload.files.reduce((sum, f) => sum + f.findings.length, 0);
   const escalationsCount = payload.files.filter((f) => f.is_escalation).length;
@@ -62,12 +63,11 @@ export async function dispatchToL2(
     const startTime    = Date.now();
 
     try {
-      const response = await fetch(remediateUrl, {
-        method: "POST",
+      const response = await fetch(targetUrl, {
+        method: 'POST',
         headers: {
-          Authorization:   `Bearer ${config.apiToken}`,
-          "Content-Type":  "application/json",
-          "X-Request-ID":  requestId,
+          'Content-Type':  'application/json',
+          'Authorization': `Bearer ${process.env.DEVSECURE_API_TOKEN}`,
         },
         body:   JSON.stringify(payload),
         signal: controller.signal,
