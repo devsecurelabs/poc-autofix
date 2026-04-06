@@ -1,24 +1,51 @@
 // Author: Jeremy Quadri
-// src/filters/dispatcher.ts — HTTP dispatcher: sends L2BatchPayload to the L2 Cloudflare Worker.
+// src/filters/dispatcher.ts — HTTP dispatcher: maps L2BatchPayload into per-finding
+// requests and fans them out to the L2 Cloudflare Worker via Promise.allSettled.
 
 import { l2BatchPayloadSchema } from "../types";
-import type { L2BatchPayload, L2DispatchResult } from "../types";
+import type { L2BatchPayload, L2DispatchResult, NormalizedFinding } from "../types";
 
-const RETRYABLE_STATUS_CODES  = new Set([429, 502, 503, 504]);
-const PERMANENT_FAILURE_CODES = new Set([400, 401, 403, 404]);
+// ---------------------------------------------------------------------------
+// Language helper
+// ---------------------------------------------------------------------------
+
+const EXT_TO_LANGUAGE: Record<string, string> = {
+  '.js':   'javascript',
+  '.jsx':  'javascript',
+  '.ts':   'typescript',
+  '.tsx':  'typescript',
+  '.py':   'python',
+  '.go':   'go',
+  '.java': 'java',
+  '.rb':   'ruby',
+  '.php':  'php',
+  '.cs':   'csharp',
+  '.cpp':  'cpp',
+  '.c':    'c',
+  '.rs':   'rust',
+};
+
+function getLanguageFromExtension(filePath: string): string {
+  const dot = filePath.lastIndexOf('.');
+  const ext  = dot !== -1 ? filePath.slice(dot).toLowerCase() : '';
+  return EXT_TO_LANGUAGE[ext] ?? 'plaintext';
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher
+// ---------------------------------------------------------------------------
 
 /**
- * POSTs a validated L2BatchPayload to the L2 Cloudflare Worker.
- * Retries on transient failures (429, 502, 503, 504) with exponential backoff.
- * Throws synchronously on config/validation errors; never swallows them silently.
+ * Maps each finding in L2BatchPayload into an individual POST to /remediate,
+ * then fans out all requests in parallel via Promise.allSettled.
+ * Returns a summary result reflecting how many dispatches succeeded or failed.
  */
 export async function dispatchToL2(
   payload: L2BatchPayload,
   config: {
-    workerUrl:   string;
-    apiToken:    string;
-    timeoutMs?:  number;
-    maxRetries?: number;
+    workerUrl:  string;
+    apiToken:   string;
+    timeoutMs?: number;
   },
 ): Promise<L2DispatchResult> {
   // --------------------------------------------------------------------------
@@ -39,116 +66,80 @@ export async function dispatchToL2(
   // --------------------------------------------------------------------------
   // Setup
   // --------------------------------------------------------------------------
-  const timeoutMs  = config.timeoutMs  ?? 30_000;
-  const maxRetries = config.maxRetries ?? 2;
-  const requestId  = crypto.randomUUID();
+  const timeoutMs = config.timeoutMs ?? 30_000;
+  const requestId = crypto.randomUUID();
+  const startTime = Date.now();
 
   const baseUrl   = process.env.DEVSECURE_WORKER_URL?.replace(/\/$/, '') || '';
   const targetUrl = `${baseUrl}/remediate`;
 
-  const findingsCount    = payload.files.reduce((sum, f) => sum + f.findings.length, 0);
-  const escalationsCount = payload.files.filter((f) => f.is_escalation).length;
-
   // --------------------------------------------------------------------------
-  // Retry loop — total attempts = maxRetries + 1
+  // Build one fetch promise per finding
   // --------------------------------------------------------------------------
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    if (attempt > 0) {
-      // Exponential backoff: 1000ms * 2^attempt (attempt=1→2000ms, attempt=2→4000ms)
-      await new Promise<void>((resolve) => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
-    }
+  const requests = payload.files.flatMap((file) =>
+    file.findings.map((finding: NormalizedFinding) => {
+      const snippet  = finding.original_findings[0]?.snippet ?? '';
+      const language = getLanguageFromExtension(file.file_path);
 
-    const controller   = new AbortController();
-    const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
-    const startTime    = Date.now();
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), timeoutMs);
 
-    try {
-      const response = await fetch(targetUrl, {
+      return fetch(targetUrl, {
         method: 'POST',
         headers: {
           'Content-Type':  'application/json',
           'Authorization': `Bearer ${process.env.DEVSECURE_API_TOKEN}`,
         },
-        body:   JSON.stringify(payload),
+        body: JSON.stringify({
+          code_context: { snippet, language },
+          finding,
+        }),
         signal: controller.signal,
       });
+    }),
+  );
 
-      clearTimeout(timeoutHandle);
-      const latencyMs         = Date.now() - startTime;
-      const responseRequestId = response.headers.get("X-Request-ID") ?? requestId;
-      const success           = response.ok;
-      const errorMessage      = success ? null : await response.text();
+  // --------------------------------------------------------------------------
+  // Fan out — collect all outcomes without short-circuiting
+  // --------------------------------------------------------------------------
+  const settled   = await Promise.allSettled(requests);
+  const latencyMs = Date.now() - startTime;
 
-      console.log(
-        JSON.stringify({
-          audit:              "l2_dispatch",
-          timestamp:          new Date().toISOString(),
-          attempt:            attempt + 1,
-          status:             response.status,
-          latency_ms:         latencyMs,
-          request_id:         responseRequestId,
-          success,
-          findings_count:     findingsCount,
-          escalations_count:  escalationsCount,
-        }),
-      );
+  let succeeded = 0;
+  let failed    = 0;
+  const errors: string[] = [];
 
-      const result: L2DispatchResult = {
-        success,
-        status:        response.status,
-        request_id:    responseRequestId,
-        latency_ms:    latencyMs,
-        error_message: errorMessage,
-      };
-
-      // Return immediately on success, permanent failure, or non-retryable status
-      if (
-        success ||
-        PERMANENT_FAILURE_CODES.has(response.status) ||
-        !RETRYABLE_STATUS_CODES.has(response.status) ||
-        attempt === maxRetries
-      ) {
-        return result;
-      }
-      // Otherwise fall through to the next iteration (retry)
-
-    } catch (err) {
-      clearTimeout(timeoutHandle);
-      const latencyMs  = Date.now() - startTime;
-      const isAbort    = err instanceof Error && err.name === "AbortError";
-      const errorMessage = isAbort
-        ? `Request timed out after ${timeoutMs}ms`
-        : err instanceof Error
-          ? err.message
-          : String(err);
-
-      console.log(
-        JSON.stringify({
-          audit:             "l2_dispatch",
-          timestamp:         new Date().toISOString(),
-          attempt:           attempt + 1,
-          status:            0,
-          latency_ms:        latencyMs,
-          request_id:        requestId,
-          success:           false,
-          findings_count:    findingsCount,
-          escalations_count: escalationsCount,
-        }),
-      );
-
-      const result: L2DispatchResult = {
-        success:       false,
-        status:        0,
-        request_id:    requestId,
-        latency_ms:    latencyMs,
-        error_message: errorMessage,
-      };
-
-      if (attempt === maxRetries) return result;
-      // Otherwise fall through to the next iteration (retry on network/timeout errors)
+  for (const result of settled) {
+    if (result.status === 'fulfilled' && result.value.ok) {
+      succeeded++;
+    } else {
+      failed++;
+      const msg = result.status === 'rejected'
+        ? String(result.reason)
+        : `HTTP ${result.value.status}`;
+      errors.push(msg);
     }
   }
 
-  // Unreachable: the loop always returns on the final attempt, but TypeScript requires this.
-  throw new Error("dispatchToL2: unexpected exit from retry loop");
+  const success = failed === 0 && settled.length > 0;
+
+  console.log(
+    JSON.stringify({
+      audit:            "l2_dispatch",
+      timestamp:        new Date().toISOString(),
+      request_id:       requestId,
+      total_dispatched: settled.length,
+      succeeded,
+      failed,
+      latency_ms:       latencyMs,
+    }),
+  );
+
+  return {
+    success,
+    status:        success ? 200 : 207,
+    request_id:    requestId,
+    latency_ms:    latencyMs,
+    error_message: errors.length > 0 ? errors.join('; ') : null,
+  };
 }
