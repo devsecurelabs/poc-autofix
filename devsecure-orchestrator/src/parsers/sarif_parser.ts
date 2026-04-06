@@ -128,8 +128,9 @@ export function parseSarifToFindings(
     const lineEnd   = typeof region?.["endLine"]   === "number" ? (region["endLine"]   as number) : lineStart;
 
     // ---------- Snippet extraction ----------
-    const snippetObj = region?.["snippet"] as Record<string, unknown> | undefined;
-    const snippet    = typeof snippetObj?.["text"] === "string" ? (snippetObj["text"] as string) : "";
+    const snippetObj   = region?.["snippet"] as Record<string, unknown> | undefined;
+    const rawSnippet   = typeof snippetObj?.["text"] === "string" ? (snippetObj["text"] as string) : "";
+    const snippet      = rawSnippet.length > 0 ? rawSnippet : "/* No snippet provided by scanner */";
 
     // ---------- CWE extraction ----------
     const cweId      = extractCweId(r);

@@ -57,7 +57,33 @@ export async function runOrchestrator(input: OrchestratorInput): Promise<Orchest
   const totalFiltered   = pipelineOutput.normalized_findings.length;
   const escalationCount = pipelineOutput.escalation_payloads.length;
 
-  // STEP C — Build the validated L2 batch payload
+  // STEP C — Early exit if there is nothing to dispatch
+  if (totalFiltered === 0 && escalationCount === 0) {
+    console.log(
+      JSON.stringify({
+        audit:     "pipeline_complete",
+        timestamp: new Date().toISOString(),
+        pr_ref:    input.config.pr_ref,
+        message:   "No findings or escalations to dispatch. Exiting cleanly.",
+        total_raw: totalRaw,
+      }),
+    );
+    return {
+      dispatch_result: {
+        success:       true,
+        status:        204,
+        request_id:    null,
+        latency_ms:    0,
+        error_message: null,
+      },
+      pipeline_stats:        pipelineOutput.pipeline_stats,
+      total_raw_findings:    totalRaw,
+      total_after_filtering: 0,
+      total_escalations:     0,
+    };
+  }
+
+  // STEP D — Build the validated L2 batch payload
   const payload = buildL2BatchPayload({
     pr_ref:              input.config.pr_ref,
     commit_sha:          input.config.commit_sha,
@@ -69,7 +95,7 @@ export async function runOrchestrator(input: OrchestratorInput): Promise<Orchest
     total_raw:           totalRaw,
   });
 
-  // STEP D — Log pipeline stats audit entry
+  // STEP E — Log pipeline stats audit entry
   console.log(
     JSON.stringify({
       audit:                "pipeline_complete",
@@ -85,13 +111,13 @@ export async function runOrchestrator(input: OrchestratorInput): Promise<Orchest
     }),
   );
 
-  // STEP E — Dispatch to L2 Cloudflare Worker
+  // STEP F — Dispatch to L2 Cloudflare Worker
   const dispatchResult = await dispatchToL2(payload, {
     workerUrl: input.config.worker_url,
     apiToken:  input.config.api_token,
   });
 
-  // STEP F — Return combined result
+  // STEP G — Return combined result
   return {
     dispatch_result:       dispatchResult,
     pipeline_stats:        pipelineOutput.pipeline_stats,

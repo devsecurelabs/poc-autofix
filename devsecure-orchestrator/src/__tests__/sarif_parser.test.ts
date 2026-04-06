@@ -1,7 +1,7 @@
 // Author: Jeremy Quadri
 // src/__tests__/sarif_parser.test.ts — Unit tests for SARIF 2.1.0 input parser (Phase 3).
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { parseSarifToFindings } from "../parsers/sarif_parser";
 
 // ---------------------------------------------------------------------------
@@ -272,20 +272,13 @@ describe("GROUP 5 — SARIF Parser", () => {
     expect(findings[0].severity).toBe("LOW");
   });
 
-  it("Skips results that fail schema validation (logs warning)", () => {
-    const warnSpy = vi.spyOn(console, "warn");
-
+  it("Uses fallback snippet when scanner omits the snippet field", () => {
     const findings = parseSarifToFindings(noSnippetSarif, "opengrep");
 
-    // Finding with empty snippet fails rawScannerFindingSchema (snippet min(1))
-    expect(findings).toHaveLength(0);
-    expect(warnSpy).toHaveBeenCalled();
-
-    const warnArg = warnSpy.mock.calls[0][0] as string;
-    const parsed  = JSON.parse(warnArg) as Record<string, unknown>;
-    expect(parsed["audit"]).toBe("sarif_parser_skip");
-
-    warnSpy.mockRestore();
+    // Finding should be retained with the fallback value instead of being dropped
+    expect(findings).toHaveLength(1);
+    expect(findings[0].snippet).toBe("/* No snippet provided by scanner */");
+    expect(findings[0].file_path).toBe("src/db/query.ts");
   });
 
   it("Returns empty array for SARIF with no results", () => {
@@ -294,7 +287,7 @@ describe("GROUP 5 — SARIF Parser", () => {
     expect(findings).toHaveLength(0);
   });
 
-  it("Handles missing snippet gracefully (no exception thrown)", () => {
+  it("Does not throw when snippet field is missing", () => {
     expect(() => parseSarifToFindings(noSnippetSarif, "opengrep")).not.toThrow();
   });
 });
