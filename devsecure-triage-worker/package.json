@@ -1,0 +1,22 @@
+{
+	"name": "devsecure-triage-worker",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"start": "wrangler dev",
+		"test": "vitest run --reporter=verbose",
+		"test:watch": "vitest",
+		"cf-typegen": "wrangler types"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.12.4",
+		"typescript": "^5.5.2",
+		"vitest": "~3.2.0",
+		"wrangler": "^3.101.0"
+	},
+	"dependencies": {
+		"zod": "^4.3.6"
+	}
+}

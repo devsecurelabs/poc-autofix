@@ -163,8 +163,8 @@ jobs:
       - name: Run DevSecure Orchestrator
         working-directory: devsecure-orchestrator
         env:
-          DEVSECURE_WORKER_URL: ${{ secrets.DEVSECURE_WORKER_URL }}
-          DEVSECURE_API_TOKEN: ${{ secrets.DEVSECURE_API_TOKEN }}
+          DEVSECURE_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
+          DEVSECURE_API_TOKEN: ${{ secrets.DEVSECURE_WORKER_SECRET }}
           PR_REF: ${{ github.event.pull_request.number }}
           COMMIT_SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}

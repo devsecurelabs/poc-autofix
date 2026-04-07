@@ -1,0 +1,49 @@
+{
+  "pr_ref": "refs/pull/42/head",
+  "commit_sha": "abc123def456789",
+  "repository": "acme/web-api",
+  "timestamp": "2026-03-25T12:00:00.000Z",
+  "scanner_versions": {
+    "opengrep": "1.2.0",
+    "bearer": "3.0.1"
+  },
+  "summary": {
+    "total_files_scanned": 5,
+    "total_raw_findings": 3,
+    "total_after_dedup": 2,
+    "total_after_filters": 1,
+    "total_escalations": 0
+  },
+  "files": [
+    {
+      "file_path": "src/routes/users.ts",
+      "code_context": "export async function getUser(req, res) {\n  const userId = req.params.id;\n  const user = await db.query(`SELECT * FROM users WHERE id = ${userId}`);\n  res.json(user);\n}",
+      "is_escalation": false,
+      "findings": [
+        {
+          "dedup_hash": "a1b2c3d4e5f6789012345678901234ab",
+          "file_path": "src/routes/users.ts",
+          "line_start": 3,
+          "line_end": 3,
+          "cwe_id": "CWE-89",
+          "cwe_category": "SQL Injection",
+          "detection_signal": "CONVERGED",
+          "max_severity": "CRITICAL",
+          "max_confidence": 0.97,
+          "original_findings": [
+            {
+              "source_scanner": "opengrep",
+              "snippet": "db.query(`SELECT * FROM users WHERE id = ${userId}`)",
+              "rule_id": "js-sqli-template-literal"
+            },
+            {
+              "source_scanner": "bearer",
+              "snippet": "userId flows into SQL query without sanitisation",
+              "rule_id": "bearer-dataflow-sqli"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

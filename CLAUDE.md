@@ -1,3 +1,4 @@
+> **STANDING RULE:** Before ending any session, update this file with new patterns, update the "Last Updated" date, and print a 3-bullet Session Summary to the terminal.
 # DevSecure v4.0: Cloud Infrastructure Architecture
 
 This document defines the cloud infrastructure and architectural mandates required to support the DevSecure v4.0 automated remediation pipeline. 
