@@ -1,44 +1,14 @@
 // Author: Jeremy Quadri
-// src/filters/dispatcher.ts — HTTP dispatcher: maps L2BatchPayload into per-finding
-// requests and fans them out to the L2 Cloudflare Worker via Promise.allSettled.
+// src/filters/dispatcher.ts — HTTP dispatcher: fans out per-finding POST requests
+// to the L2 Cloudflare Worker /remediate endpoint via Promise.allSettled.
 
 import { l2BatchPayloadSchema } from "../types";
-import type { L2BatchPayload, L2DispatchResult, NormalizedFinding } from "../types";
-
-// ---------------------------------------------------------------------------
-// Language helper
-// ---------------------------------------------------------------------------
-
-const EXT_TO_LANGUAGE: Record<string, string> = {
-  '.js':   'javascript',
-  '.jsx':  'javascript',
-  '.ts':   'typescript',
-  '.tsx':  'typescript',
-  '.py':   'python',
-  '.go':   'go',
-  '.java': 'java',
-  '.rb':   'ruby',
-  '.php':  'php',
-  '.cs':   'csharp',
-  '.cpp':  'cpp',
-  '.c':    'c',
-  '.rs':   'rust',
-};
-
-function getLanguageFromExtension(filePath: string): string {
-  const dot = filePath.lastIndexOf('.');
-  const ext  = dot !== -1 ? filePath.slice(dot).toLowerCase() : '';
-  return EXT_TO_LANGUAGE[ext] ?? 'plaintext';
-}
-
-// ---------------------------------------------------------------------------
-// Dispatcher
-// ---------------------------------------------------------------------------
+import type { L2BatchPayload, L2DispatchResult } from "../types";
 
 /**
- * Maps each finding in L2BatchPayload into an individual POST to /remediate,
- * then fans out all requests in parallel via Promise.allSettled.
- * Returns a summary result reflecting how many dispatches succeeded or failed.
+ * Iterates every finding in the L2BatchPayload and POSTs each one individually
+ * to the /remediate endpoint. All requests are fired concurrently via
+ * Promise.allSettled so a single failure does not cancel the rest.
  */
 export async function dispatchToL2(
   payload: L2BatchPayload,
@@ -70,16 +40,15 @@ export async function dispatchToL2(
   const requestId = crypto.randomUUID();
   const startTime = Date.now();
 
-  const baseUrl   = process.env.DEVSECURE_WORKER_URL?.replace(/\/$/, '') || '';
-  const targetUrl = `${baseUrl}/remediate`;
+  const targetUrl = `${process.env.DEVSECURE_WORKER_URL?.replace(/\/$/, '')}/remediate`;
 
   // --------------------------------------------------------------------------
   // Build one fetch promise per finding
   // --------------------------------------------------------------------------
   const requests = payload.files.flatMap((file) =>
-    file.findings.map((finding: NormalizedFinding) => {
-      const snippet  = finding.original_findings[0]?.snippet ?? '';
-      const language = getLanguageFromExtension(file.file_path);
+    file.findings.map((finding) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const snippet = (finding as any).snippet || "/* no snippet */";
 
       const controller = new AbortController();
       setTimeout(() => controller.abort(), timeoutMs);
@@ -91,7 +60,10 @@ export async function dispatchToL2(
           'Authorization': `Bearer ${process.env.DEVSECURE_API_TOKEN}`,
         },
         body: JSON.stringify({
-          code_context: { snippet, language },
+          code_context: {
+            snippet,
+            language: "javascript",
+          },
           finding,
         }),
         signal: controller.signal,
@@ -116,7 +88,7 @@ export async function dispatchToL2(
       failed++;
       const msg = result.status === 'rejected'
         ? String(result.reason)
-        : `HTTP ${result.value.status}`;
+        : `HTTP ${(result as PromiseFulfilledResult<Response>).value.status}`;
       errors.push(msg);
     }
   }
